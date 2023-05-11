@@ -1,0 +1,4205 @@
+# to do (current version)
+# Do we have all pedar insoles? Double check areas
+# add more input tests to throw errors
+# check/make pedar work for a lot of these functions
+# automask2: toe line modifications
+# fscan processing needs to be checked (work with NA?)
+# in edit_mask, make edit_list a vector that works with numbers or names?
+# fix toe side on mask2 pedar mask
+
+
+# to do (future)
+# global pressure_import function (leave for V2)
+# create masks for iscan during startup
+# CPEI manual edit to be built into function
+# cop for pedar
+# add support for pliance
+
+# data list:
+## Array. pressure data
+## String. data type (usually collection system, e.g. emed)
+## Numeric. sens_size. sensor size
+## Numeric. Single number time between samples
+## List. Mask list
+## Data frame. Events (for example, to define start/end of individual steps for insole data)
+
+
+# =============================================================================
+
+#' @title Load emed data
+#' @description Imports and formats .lst files collected on emed system and
+#'    exported from Novel software
+#' @param pressure_filepath String. Filepath pointing to emed pressure file
+#' @return A list with information about the pressure data.
+#' \itemize{
+#'   \item pressure_array. 3D array covering each timepoint of the measurement.
+#'            z dimension represents time
+#'   \item pressure_system. String defining pressure system
+#'   \item sens_size. Numeric vector with the dimensions of the sensors
+#'   \item time. Numeric value for time between measurements
+#'   \item masks. List
+#'   \item events. List
+#'  }
+#' @examples
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' @importFrom stringr str_extract_all str_detect
+#' @importFrom utils read.fwf read.table
+#' @export
+
+load_emed <- function(pressure_filepath) {
+  # check parameters
+  ## file exists
+  if (file.exists(pressure_filepath) == FALSE)
+    stop("file does not exist")
+
+  ## extension is correct
+  if (str_split(basename(pressure_filepath), "\\.")[[1]][2] != "lst")
+    stop("incorrect file extension, expected .lst")
+
+  # Read unformatted emed data
+  pressure_raw <- readLines(pressure_filepath, warn = FALSE)
+
+  # get sensor size
+  sens_size_ln <- which(grepl("Sensor size", pressure_raw, useBytes = TRUE))[1]
+  sens_size <- str_extract_all(pressure_raw[sens_size_ln], "\\d+\\.\\d+")
+  sens_size <- as.numeric(unlist(sens_size))
+  if (str_detect(pressure_raw[sens_size_ln], "cm") == TRUE) {
+    sens_size <- sens_size * 0.01
+  }
+
+  # get capture frequency
+  time_line <- which(grepl("Time", pressure_raw, useBytes = TRUE))[1]
+  time_ln <- str_split(pressure_raw[time_line], "picture:")[[1]][2]
+  time <- as.numeric(unlist(str_extract_all(time_ln, "\\d+\\.\\d+")))
+  if (str_detect(time_ln, "ms") == TRUE) {time <- time / 1000}
+
+  # determine position breaks
+  breaks <- grep("Page", pressure_raw)
+
+  # identify and remove any summary frames
+  frame_type <- pressure_raw[breaks + 8]
+  MVP <- which(grepl("MVP", frame_type, fixed = TRUE))
+  MPP <- which(grepl("MPP", frame_type, fixed = TRUE))
+  if (length(MVP) > 0 | length(MPP) > 0) {
+    breaks <- breaks[1:(min(c(MVP, MPP)) - 1)]
+  }
+  breaks <- breaks[str_detect(frame_type, "Pict")]
+  breaks <- breaks[!is.na(breaks)]
+
+  # get blank lines
+  ends <- which(pressure_raw == "\x0C")
+
+  # how many frames in each measurement
+  nfs <- sum(str_detect(pressure_raw[breaks + 8], "Pict\\-No\\.\\: 1 "),
+             na.rm = TRUE)
+
+  # how many measurements
+  n_meas <- floor(length(breaks)/nfs)
+
+  # empty array
+  pressure_array <- array(0, dim = c(95, 64, n_meas))
+  for (i in 1:n_meas) {
+    for (j in 1:nfs) {
+      # start line
+      str <- (nfs * i) - nfs + j
+
+      # load as table
+      y <- pressure_raw[(breaks[str] + 10):(ends[which(ends > breaks[str])[1]] - 2)]
+      num_col <- unlist(str_split(y[1], "\\s+"))
+      wids <- rep(8, times = length(num_col))
+      if (nfs > 1) {
+        z <- read.fwf(textConnection(y), widths = wids)
+      } else {
+        z <- read.table(textConnection(y), sep = "\t")
+      }
+
+      colnames(z) <- unname(z[1, ])
+      z <- z[2:nrow(z), ]
+
+      # remove zeros
+      z[is.na(z)] <- 0
+
+      # remove force column
+      if (colnames(z)[ncol(z)] == "Force") {z <- z[, 1:(ncol(z) - 1)]}
+
+      # remove force row
+      if (z[nrow(z), 1] == "Force") {z <- z[1:(nrow(z) - 1),]}
+
+      # column numbers
+      cn <- as.numeric(colnames(z)[2:length(z)])
+
+      # row numbers
+      rn <- unname(unlist((z[, 1])))
+      z <- as.matrix(z[, 2:ncol(z)])
+      z <- matrix(as.numeric(z), ncol = ncol(z))
+
+      # add to array
+      pressure_array[rn, cn, i] <- z
+    }
+  }
+
+  # remove zero columns and rows
+  ## make max footprint
+  fp <- apply(simplify2array(pressure_array), 1:2, max)
+
+  ## rows
+  rsums <- rowSums(fp)
+  minr <- min(which(rsums > 0))
+  maxr <- max(which(rsums > 0))
+
+  ## columns
+  csums <- colSums(fp)
+  minc <- min(which(csums > 0))
+  maxc <- max(which(csums > 0))
+
+  ## update pressure array
+  pressure_array <- pressure_array[minr:maxr, minc:maxc,]
+
+  # return formatted emed data
+  return(list(pressure_array = pressure_array, pressure_system = "emed",
+              sens_size = sens_size,
+              time = time, masks = NULL, events = NULL))
+}
+
+
+# =============================================================================
+
+#' @title Load pedar data
+#' @description Imports and formats .asc files collected on pedar system and
+#'    exported from Novel software
+#' @param pressure_filepath String. Filepath pointing to emed pressure file
+#' @return A list with information about the pressure data.
+#' \itemize{
+#'   \item pressure_array. 3D array covering each timepoint of the measurement.
+#'            z dimension represents time
+#'   \item pressure_system. String defining pressure system
+#'   \item sens_size. String with sensor type
+#'   \item time. Numeric value for time between measurements
+#'   \item masks. List
+#'   \item events. List
+#'  }
+#' @examples
+#' pedar_data <- system.file("extdata", "pedar_example.asc", package = "pressuRe")
+#' pressure_data <- load_pedar(pedar_data)
+#' @importFrom stringr str_split str_trim
+#' @export
+
+load_pedar <- function(pressure_filepath) {
+  # check parameters
+  ## file exists
+  if (file.exists(pressure_filepath) == FALSE)
+    stop("file does not exist")
+
+  ## extension is correct
+  if (str_split(basename(pressure_filepath), "\\.")[[1]][2] != "asc")
+    stop("incorrect file extension, expected .asc")
+
+  # measurement data
+  ## header
+  header <- readLines(pressure_filepath, n = 3)
+
+  # Identify insole
+  insole_type_ln <- str_split(header[2], "\\:")[[1]][2]
+  insole_type <- str_split(insole_type_ln, "\\-")[[1]][1]
+  insole_type <- str_trim(insole_type)[[1]][1]
+
+  # Get time between measurements
+  time_ln <- str_split(header[3], "\\[Hz\\]\\:")[[1]][2]
+  time <- 1 / as.numeric(time_ln)
+
+  # import data
+  pressure_data <- as.data.frame(read.table(pressure_filepath,
+                                            sep = "", skip = 10,
+                                            header = FALSE))
+
+  # make into 2 (left and right insole) x 99 (sensors) x time array
+  pressure_array <- array(0, dim = c(2, 99, nrow(pressure_data)))
+  for (i in 1:nrow(pressure_data)) {
+    pressure_array[1, , i] <- unlist(unname(pressure_data[i, c(101:199)]))
+    pressure_array[2, , i] <- unlist(unname(pressure_data[i, c(2:100)]))
+  }
+
+  # return
+  return(list(pressure_array = pressure_array, pressure_system = "pedar",
+              sens_size = insole_type, time = time, masks = NULL,
+              events = NULL))
+}
+
+
+# =============================================================================
+
+#' @title Load Tekscan data
+#' @description Imports and formats files collected on tekscan systems and
+#'    exported from Tekscan software
+#' @param pressure_filepath String. Filepath pointing to emed pressure file
+#' @return A list with information about the pressure data.
+#' \itemize{
+#'   \item pressure_array. 3D array covering each timepoint of the measurement.
+#'            z dimension represents time
+#'   \item pressure_system. String defining pressure system
+#'   \item sens_size. Numeric vector with the dimensions of the sensors
+#'   \item time. Numeric value for time between measurements
+#'   \item masks. List
+#'   \item events. List
+#'  }
+#'  @examples
+#' tekscan_data <- system.file("extdata", "fscan_testL.asf", package = "pressuRe")
+#' pressure_data <- load_tekscan(tekscan_data)
+#'  @importFrom
+#'  @export
+
+load_tekscan <- function(pressure_filepath) {
+  # check parameters
+  ## file exists
+  if (file.exists(pressure_filepath) == FALSE)
+    stop("file does not exist")
+
+  ## extension is correct
+  file_ext <- str_split(basename(pressure_filepath), "\\.")[[1]][2]
+  if (file_ext != "asf" & file_ext != "csv")
+    stop("incorrect file extension, expected .asf or .csv")
+
+  # Read unformatted data
+  pressure_raw <- readLines(pressure_filepath, warn = FALSE)
+
+  # get sensor size
+  sens_size <- c(NA, NA)
+  sens_width <- which(grepl("ROW_SPACING", pressure_raw))
+  sens_width_ <- str_extract_all(pressure_raw[sens_width], "\\d+\\.\\d+")
+  sens_size[1] <- as.numeric(unlist(sens_width_))
+  sens_height <- which(grepl("COL_SPACING", pressure_raw))
+  sens_height_ <- str_extract_all(pressure_raw[sens_height], "\\d+\\.\\d+")
+  sens_size[2] <- as.numeric(unlist(sens_height_))
+  if (str_detect(pressure_raw[sens_width], "mm") == TRUE) {
+    sens_size <- sens_size * 0.001
+  }
+  if (str_detect(pressure_raw[sens_width], "centimeters") == TRUE) {
+    sens_size <- sens_size * 0.01
+  }
+
+  # get capture frequency
+  time_line <- which(grepl("SECONDS_PER_FRAME", pressure_raw))
+  time_ln <- str_split(pressure_raw[time_line], "FRAME ")[[1]][2]
+  time <- as.numeric(unlist(str_extract_all(time_ln, "\\d+\\.\\d+")))
+
+  # determine position breaks
+  breaks <- grep("Frame", pressure_raw)
+
+  # determine matrix dimensions
+  col_n <- length(strsplit(pressure_raw[breaks[1] + 1], ",")[[1]])
+  row_n <- breaks[2] - breaks[1] - 2
+
+  # empty array
+  pressure_array <- array(0, dim = c(row_n, col_n, length(breaks)))
+
+  # fill array
+  for (i in 1:length(breaks)) {
+    # frame
+    y <- pressure_raw[(breaks[i] + 1):(breaks[i] + row_n)]
+    z <- read.table(textConnection(y), sep = ",")
+    z[z == "B"] <- -1
+    z <- as.data.frame(lapply(z, as.numeric))
+    pressure_array[, , i] <- as.matrix(z)
+  }
+
+  # return formatted data
+  return(list(pressure_array = pressure_array, pressure_system = "tekscan",
+              sens_size = sens_size,
+              time = time, masks = NULL, events = NULL))
+}
+
+
+# =============================================================================
+
+#' @title Load footscan data
+#' @description Imports and formats files collected on footscan systems
+#' (formerly RSScan)
+#' @param pressure_filepath String. Filepath pointing to emed pressure file
+#' @return A list with information about the pressure data.
+#' \itemize{
+#'   \item pressure_array. 3D array covering each timepoint of the measurement.
+#'            z dimension represents time
+#'   \item pressure_system. String defining pressure system
+#'   \item sens_size. Numeric vector with the dimensions of the sensors
+#'   \item time. Numeric value for time between measurements
+#'   \item masks. List
+#'   \item events. List
+#'  }
+#'  @examples
+#' footscan_data <- system.file("extdata", "footscan_test.xls", package = "pressuRe")
+#' pressure_data <- load_footscan(footscan_data)
+#'  @importFrom readxl read_excel
+#'  @export
+
+load_footscan <- function(pressure_filepath) {
+  # check parameters
+  ## file exists
+  if (file.exists(pressure_filepath) == FALSE)
+    stop("file does not exist")
+
+  ## extension is correct
+  if (str_split(basename(pressure_filepath), "\\.")[[1]][2] != "xls")
+    stop("incorrect file extension, expected .xls")
+
+  # Read unformatted data
+  pressure_raw <- readxl::read_excel(pressure_filepath,
+                                     .name_repair = "minimal")
+
+  # sensor size
+  sens_size <- c(0.00508, 0.00762)
+  sens_area <- sens_size[1] * sens_size[2]
+
+  # determine position breaks
+  c1 <- unname(unlist(as.vector(pressure_raw[, 1])))
+  breaks <- grep("Frame", c1)
+
+  # get capture frequency
+  time <- regmatches(c1[breaks[2]], gregexpr("(?<=\\().*?(?=\\))",
+                                             c1[breaks[2]], perl = T))[[1]]
+  time <- as.numeric(unlist(str_split(time, " "))[1]) * 0.001
+
+  # determine matrix dimensions
+  col_n <- ncol(pressure_raw)
+  row_n <- breaks[2] - breaks[1] - 2
+
+  # empty array
+  pressure_array <- array(0, dim = c(row_n, col_n, length(breaks)))
+
+  # frame
+  for (i in 1:length(breaks)) {
+    z <- pressure_raw[(breaks[i] + 1):(breaks[i] + row_n), ]
+    z <- as.matrix(as.data.frame(lapply(z, as.numeric)))
+    z <- z[nrow(z):1, ]
+    pressure_array[, , i] <- z / (sens_area * 1000)
+  }
+
+  # return formatted data
+  return(list(pressure_array = pressure_array, pressure_system = "footscan",
+              sens_size = sens_size,
+              time = time, masks = NULL, events = NULL))
+}
+
+
+# =============================================================================
+
+#' @title Interpolate pressure data
+#' @description Resamples pressure data over time. Useful for normalizing to
+#' stance phase, for example
+#' @param pressure_data List. First item should be a 3D array covering each
+#' timepoint of the measurement. z dimension represents time.
+#' @param interp_to Integer. Number of frames to interpolate to
+#' @return
+#' \itemize{
+#'   \item pressure_array. 3D array covering each timepoint of the measurement.
+#'            z dimension represents time
+#'   \item pressure_system. String defining pressure system
+#'   \item sens_size. Numeric vector with the dimensions of the sensors
+#'   \item time. Numeric value for time between measurements
+#'   \item masks. List
+#'   \item events. List
+#'  }
+#' @examples
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' pressure_data <- pressure_interp(pressure_data, interp_to = 101)
+#' @export
+
+pressure_interp <- function(pressure_data, interp_to) {
+  # check inputs
+  if (is.array(pressure_data[[1]]) == FALSE)
+    stop("pressure_frames input must contain an array")
+  if (is.numeric(interp_to) & interp_to < 2)
+    stop("interp_to must be a numeric value greater than 2")
+  interp_to <- round(interp_to)
+
+  # make new empty array
+  dims <- dim(pressure_data[[1]])
+  interp_array <- array(NA, dim = c(dims[1], dims[2], interp_to))
+
+  # interpolate array
+  pressure_array <- pressure_data[[1]]
+  for (i in 1:dims[1]) {
+    for (j in 1:dims[2]) {
+      interp_array[i, j, ] <- approxP(pressure_array[i, j, ], interp_to)
+    }
+  }
+
+  # timing
+  time_seq <- seq(0, by = pressure_data[[4]], length.out = dims[3])
+  time_seq_int <- approxP(time_seq, interp_to)
+  time_sample_int <- time_seq_int[2] - time_seq_int[1]
+
+  # update pressure data
+  pressure_data[[1]] <- interp_array
+  pressure_data[[4]] <- time_sample_int
+
+  # return interpolated pressure data
+  return(pressure_data)
+}
+
+
+# =============================================================================
+
+#' @title Select steps
+#' @description Select steps, usually from insole data, and format for analysis
+#' @param pressure_data List. First item should be a 3D array covering each
+#' timepoint of the measurement. z dimension represents time.
+#' @param threshold Numeric. Threshold force to define start and end of step
+#' @param min_frames Numeric. Minimum number of frames that need to be in step
+#' @param n_steps Numeric. Target number of steps/cycles. User will be
+#' asked to keep selected steps until this target is reached or they run out of
+#' candidate steps
+#' @param skip Numeric. Usually the first few steps of a trial are accelerating
+#' and not representative of steady state walking so this removes them
+#' @return
+#' \itemize{
+#'   \item pressure_array. 3D array covering each timepoint of the measurement.
+#'            z dimension represents time
+#'   \item pressure_system. String defining pressure system
+#'   \item sens_size. Numeric vector with the dimensions of the sensors
+#'   \item time. Numeric value for time between measurements
+#'   \item masks. List
+#'   \item events. List
+#'   }
+#' @examplesIf interactive()
+#' pedar_data <- system.file("extdata", "pedar_example.asc", package = "pressuRe")
+#' pressure_data <- load_pedar(pedar_data)
+#' pressure_data <- select_steps(pressure_data)
+#' @importFrom ggplot2 ggplot aes geom_line xlab ylab ggtitle
+#' @importFrom magrittr "%>%"
+#' @importFrom dplyr filter
+#' @importFrom utils menu
+#' @export
+
+select_steps <- function (pressure_data, threshold = 20, min_frames = 10,
+                          n_steps = 5, skip = 2) {
+  # set up global variables
+  frame <- NULL
+
+  # check session is interactive
+  if (interactive() == FALSE)
+    stop("user needs to select suitable steps")
+
+  # check this is pedar (or other suitable) data
+  if (!(pressure_data[[2]] == "pedar" || pressure_data[[2]] == "tekscan"))
+    stop("data should be from pedar or f-scan")
+
+  # get force df
+  if (pressure_data[[2]] == "pedar") {
+    te_R <- threshold_event(pressure_data, threshold[1], min_frames, "RIGHT")
+    te_L <- threshold_event(pressure_data, threshold[length(threshold)],
+                            min_frames, "LEFT")
+    df_R <- te_R[[1]]
+    df_L <- te_L[[1]]
+    FS_events_R <- te_R[[2]]
+    FO_events_R <- te_R[[3]]
+    FS_events_L <- te_L[[2]]
+    FO_events_L <- te_L[[3]]
+
+    # approve steps
+    events_R <- approve_step(df_R, FS_events_R, FO_events_R, n_steps, "RIGHT")
+    events_L <- approve_step(df_L, FS_events_L, FO_events_L, n_steps, "LEFT")
+
+    # event df
+    event_df <- rbind(events_R, events_L)
+  } else {
+    thr_ev <- threshold_event(pressure_data, threshold[1], min_frames)
+    df <- thr_ev[[1]]
+    FS_events <- thr_ev[[2]]
+    FO_events <- thr_ev[[3]]
+
+    # approve steps
+    event_df <- approve_step(df, FS_events, FO_events)
+  }
+
+  # add events to pressure data
+  pressure_data[[6]] <- event_df
+
+  # Return
+  return(pressure_data)
+}
+
+
+# =============================================================================
+
+#' @title Detect foot side
+#' @description Detects which foot plantar pressure data is from (left or
+#' right), usually would only be needed for pressure plate data. Generally
+#' reliable but may be thrown off by severe deformities or abnormal walking
+#' patterns
+#' @param pressure_data List. First item should be a 3D array covering each
+#' timepoint of the measurement. z dimension represents time
+#' @return String. "LEFT" or "RIGHT"
+#' @examples
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' auto_detect_side(pressure_data)
+#' @importFrom sf st_polygon st_as_sf st_convex_hull st_combine
+#' st_intersection st_area
+#' @importFrom stats dist
+#' @export
+
+auto_detect_side <- function(pressure_data) {
+  # throw error if pedar data
+  if (pressure_data[[2]] == "pedar")
+    stop("This function does not work for pedar data")
+
+  # max pressure footprint
+  sc_df <- sensor_2_polygon(pressure_data, output = "df")[, c(1, 2)]
+  sc_df <- sc_df[!duplicated(sc_df), ]
+
+  # Bounding box
+  mbb <- getMinBBox(as.matrix(sc_df))
+  side1 <- mbb[c(1, 2), ]
+  side2 <- mbb[c(3, 4), ]
+
+  # get midpoints
+  midpoint_top <- (side1[2, ] + side2[2, ]) / 2
+  midpoint_bottom <- (side1[1, ] + side2[1, ]) / 2
+
+  # make lat and med box
+  side1_pts <- rbind(side1, midpoint_top, midpoint_bottom, side1[1, ])
+  side2_pts <- rbind(side2, midpoint_top, midpoint_bottom, side2[1, ])
+  box1 <- st_polygon(list(side1_pts))
+  box2 <- st_polygon(list(side2_pts))
+
+  # make chull
+  df.sf <- sc_df %>%
+    st_as_sf(coords = c( "x", "y" ))
+  fp_chull <- st_convex_hull(st_combine(df.sf))
+
+  # area in each half box
+  side1_count <- st_area(st_intersection(fp_chull, box1))
+  side2_count <- st_area(st_intersection(fp_chull, box2))
+
+  # side
+  if (side1_count < side2_count) {
+    side <- "RIGHT"
+  } else {
+    side <- "LEFT"
+  }
+
+  # Return side
+  return(side)
+}
+
+
+# =============================================================================
+
+#' @title Whole pressure curve
+#' @description Generates vectors with option to plot for force, peak/mean
+#' pressure and area for complete measurement. Useful for checking data
+#' @param pressure_data List. A 3D array covering each timepoint of the
+#'   measurement. z dimension represents time
+#' @param variable String. "peak_pressure", "force", or "area"
+#' @param side For insole data only
+#' @param threshold Numeric. Threshold value for sensor to be considered active.
+#' Currently only applies to insole data
+#' @param plot Logical. If TRUE also plots data as line curve
+#' @return Numeric vector containing variable values
+#' @examples
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' whole_pressure_curve(pressure_data, variable = "force", plot = TRUE)
+#' @importFrom ggplot2 aes ggplot geom_line theme_bw xlab ylab
+#' @export
+
+whole_pressure_curve <- function(pressure_data, variable, side, threshold = 10,
+                                 plot = FALSE) {
+  # set global variables
+  time <- value <- NULL
+
+  # check input
+  if (is.array(pressure_data[[1]]) == FALSE)
+    stop("pressure_frames input must contain an array")
+  if(pressure_data[[2]] == "pedar" & missing(side) == TRUE)
+    stop("pedar data needs to have side defined")
+
+  # create empty vector to store variable
+  values <- rep(NA, times = dim(pressure_data[[1]])[3])
+
+  # force
+  if (variable == "force") {
+    if (pressure_data[[2]] == "pedar") {
+        if (side == "RIGHT") {
+          values <- force_pedar(pressure_data, variable = "force")[, 1]
+        }
+        if (side == "LEFT") {
+          values <- force_pedar(pressure_data, variable = "force")[, 2]
+        }
+    } else {
+      sens_area <- pressure_data[[3]][1] * pressure_data[[3]][2]
+      force_array <- pressure_data[[1]] * sens_area * 1000
+
+      # find total force for each frame and store in vector
+      for (i in 1:dim(force_array)[3]) {
+        values[i] <- sum(force_array[, , i])
+      }
+    }
+    variable_units <- "force (N)"
+  }
+
+  # peak pressure
+  if (variable == "peak_pressure") {
+    if (pressure_data[[2]] == "pedar") {
+      if (side == "RIGHT") {
+        mat_r <- pressure_data[[1]][1, ,]
+        values <- apply(mat_r, 2, max, na.rm = TRUE)
+      }
+      if (side == "LEFT") {
+        mat_r <- pressure_data[[1]][2, ,]
+        values <- apply(mat_r, 2, max, na.rm = TRUE)
+      }
+    } else {
+      for (i in 1:dim(pressure_data[[1]])[3]) {
+        values[i] <- max(pressure_data[[1]][, , i])
+      }
+    }
+    variable_units <- "peak pressure (kPa)"
+  }
+
+  # area
+  if (variable == "area") {
+    if (pressure_data[[2]] == "pedar") {
+      if (side == "RIGHT") {
+        values <- force_pedar(pressure_data, variable = "area", threshold)[, 1]
+      }
+      if (side == "LEFT") {
+        values <- force_pedar(pressure_data, variable = "area", threshold)[, 2]
+      }
+    } else {
+      # sensor size
+      sen_size <- pressure_data[[3]][1] * pressure_data[[3]][2]
+
+      # find active area for each frame and store in vector
+      for (i in 1:dim(pressure_data[[1]])[3]) {
+        values[i] <- (sum(pressure_data[[1]][, , i] > 0)) * sen_size * 10000
+      }
+    }
+    variable_units <- "contact area (cm2)"
+  }
+
+  # plot, if required
+  if (plot == TRUE) {
+    # make df
+    variable_df <- data.frame(value = values,
+                              time = seq(0, by = pressure_data[[4]],
+                                         length.out = length(values)))
+
+    # plot
+    g <- ggplot(variable_df, aes(x = time, y = value))
+    g <- g + geom_line()
+    g <- g + theme_bw()
+    g <- g + xlab("time (s)") + ylab(variable_units)
+    print(g)
+  }
+
+  # return
+  return(values)
+}
+
+
+
+# =============================================================================
+
+#' @title Center of pressure
+#' @description Generates xy coordinates for center of pressure during each
+#' frame of measurement
+#' @param pressure_data List. First item is a 3D array covering each timepoint
+#' of the measurement. z dimension represents time
+#' @return Data frame with x and y coordinates of COP throughout trial
+#' @examples
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' cop(pressure_data)
+#' @export
+
+cop <- function(pressure_data) {
+  # check input
+  if (is.array(pressure_data[[1]]) == FALSE)
+    stop("pressure_frames input must contain an array")
+
+  # check not pedar
+  if (pressure_data[[2]] == "pedar")
+    stop("pedar data currently not supported for this function")
+
+  # array dimensions
+  x <- pressure_data[[1]]
+  dims <- dim(x)
+
+  # individual sensor dimensions
+  sens_dim <- pressure_data[[3]]
+
+  # loading totals by column
+  col_total <- data.frame(matrix(NA, nrow = dims[2], ncol = dims[3]))
+  for (i in 1:dims[3]) {col_total[, i] <- colSums(x[, , i])}
+
+  # Loading totals by row
+  row_total <- data.frame(matrix(NA, nrow = dims[1], ncol = dims[3]))
+  for (i in 1:dims[3]) {row_total[, i] <- rowSums(x[, , i])}
+
+  # Sensor spacing in x direction
+  sens_spacing_x <- seq(from = sens_dim[1] / 2, by = sens_dim[1],
+                        length.out = dims[2])
+
+  # Sensor spacing in y direction
+  sens_spacing_y <- rev(seq(from = sens_dim[2] / 2, by = sens_dim[2],
+                            length.out = dims[1]))
+
+  # COP coordinates in x direction
+  x_coord <- c()
+  for (i in 1:dims[3]) {
+    p_total <- sum(col_total[, i])
+    x_coord[i] <- (sum(sens_spacing_x * col_total[, i])) / p_total
+  }
+
+  # COP coordinates in y direction
+  y_coord <- c()
+  for (i in 1:dims[3]) {
+    p_total <- sum(row_total[, i])
+    y_coord[i] <- (sum(sens_spacing_y * row_total[, i])) / p_total
+  }
+
+  # combine coordinates into dataframe
+  COP_df <- data.frame(x_coord, y_coord)
+
+  # return COP coordinates
+  return(COP_df)
+}
+
+
+# =============================================================================
+
+#' @title Footprint
+#' @description Determines footprint of pressure data
+#' @param pressure_data List. Includes a 3D array covering each timepoint of the
+#'   measurement. z dimension represents time
+#' @param variable String. "max" = maximum value of each sensor across full
+#' dataset. "mean" = average value of sensors over full dataset."frame" = an
+#' individual pressure frame
+#' @param frame Integer. Only used if variable = "frame".
+#' @param plot Logical. Display pressure image
+#' @return Matrix. Maximum or mean values for all sensors
+#' @examples
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' footprint(pressure_data, plot = TRUE)
+#' @export
+
+footprint <- function(pressure_data, variable = "max", frame = NULL,
+                      plot = FALSE) {
+  # check input
+  if (is.array(pressure_data[[1]]) == FALSE)
+    stop("pressure_frames input must contain an array")
+  stopifnot("Unknown Variable" = variable %in% c("max", "mean", "frame"))
+  if (variable == "frame" & missing(frame))
+    stop("For a single frame, a value is needed for frame variable")
+
+  # calculate footprint for different variables
+  if (variable == "max") {
+    mat <- apply(simplify2array(pressure_data[[1]]), 1:2, max)
+  }
+  if (variable == "mean") {
+    mat <- apply(simplify2array(pressure_data[[1]]), 1:2, mean)
+  }
+  if (variable == "frame") {
+    if(frame <= dim(pressure_data[[1]])[3]){
+      mat <- pressure_data[[1]][,, frame]
+    } else {
+      stop("The frame selected is greater that the number of frames available")
+    }
+  }
+
+  # plot if requested
+  if (plot == TRUE) {g <- plot_pressure(pressure_data, variable, frame)}
+
+  # return footprint
+  return(mat)
+}
+
+
+# =============================================================================
+
+#' @title Plot pressure
+#' @description Produces visualization of pressure data
+#' @param pressure_data List. Includes a 3D array covering each timepoint of the
+#'   measurement. z dimension represents time
+#' @param variable String. "max" = footprint of maximum sensors. "mean" =
+#' average value of sensors over time (usually for static analyses). "frame" =
+#' an individual frame
+#' @param frame Integer.
+#' @param step_n If numeric, the step number to plot (only for insole data).
+#' @param smooth Logical. Not implemented. If TRUE, plot will interpolate
+#'   between sensors to increase data density
+#' @param plot_COP Logical. If TRUE, overlay COP data on plot. Default = FALSE
+#' @param plot_outline Logical. If TRUE, overlay convex hull outline on plot
+#' @param plot_colors String. "default": novel color scheme; "custom": user
+#' supplied
+#' @param break_values Vector. If plot_colors is "custom", values to split
+#' colors at
+#' @param break_colors Vector. If plot_colors is "custom", colors to use.
+#' Should be one shorter than break_values
+#' @param sensor_outline Logical. Sensor outline to be shown
+#' @param plot Logical. If TRUE, plot will be displayed
+#' @param legend Logical. If TRUE, legend will be added to plot
+#' @return ggplot plot object
+#' @examples
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' plot_pressure(pressure_data, variable = "max", plot_COP = FALSE)
+#' plot_pressure(pressure_data, variable = "frame", frame = 20,
+#'               plot_colors = "custom", break_values = c(100, 200, 300, 750),
+#'               break_colors = c("blue", "green", "yellow", "red", "pink"))
+#' @importFrom ggplot2 ggplot aes geom_raster geom_polygon scale_fill_manual
+#' theme geom_point element_rect binned_scale unit
+#' @importFrom scales manual_pal
+#' @export
+
+plot_pressure <- function(pressure_data, variable = "max", smooth = FALSE, frame,
+                          step_n = "max", plot_COP = FALSE, plot_outline = FALSE,
+                          plot_colors = "default", break_values, break_colors,
+                          sensor_outline = TRUE, plot = TRUE, legend = TRUE) {
+  # set global variables
+  x <- y <- X <- Y <- id <- cols <- x_coord <- y_coord <- value <- NULL
+
+  # check inputs
+  if (is.array(pressure_data[[1]]) == FALSE)
+    stop("pressure data must contain array")
+
+  # if pedar
+  if (pressure_data[[2]] == "pedar") {
+    if (step_n == "max") {pedar_var <- "max"; step_no <- NA}
+    if (is.numeric(step_n)) {pedar_var <- "step_max"; step_no <- step_n}
+    cor <- plot_pedar(pressure_data, pedar_var, step_no, foot_side = "both")
+    x_lim <- max(cor$x)
+    y_lim <- max(cor$y)
+    legend_spacing <- (cor$x[2] - cor$x[1]) * 10
+  } else {
+    # max size of df
+    fp_sens <- sensor_2_polygon(pressure_data, pressure_image = "all_active",
+                                output = "df")
+    x_lim <- max(fp_sens$x)
+    y_lim <- max(fp_sens$y) + .02
+
+    # footprint
+    fp <- footprint(pressure_data, variable = variable, frame)
+
+    # get footprint vector
+    fp <- as.vector(fp)
+    fp <- fp[fp > 0]
+
+    # generate coordinates for each sensor
+    sens_poly <- sensor_2_polygon(pressure_data, pressure_image = variable,
+                                  frame, output = "df")
+
+    # combine with pressure values
+    ids <- c(1:length(as.vector(fp)))
+    vals <- data.frame(id = ids, value = as.vector(fp))
+
+    # merge value and coordinate frames
+    cor <- merge(sens_poly, vals, by = c("id"))
+
+    # add colors
+    cor <- generate_colors(cor, col_type = plot_colors, break_values,
+                           break_colors)
+
+    # plot
+    legend_spacing <- pressure_data[[3]][1] * 100
+  }
+
+  if (plot_colors == "default") {
+    break_colors <- c("grey","lightblue", "darkblue","green","yellow",
+                      "red", "pink")
+    break_values <- c(0, 40, 60, 100, 150, 220, 300)
+  }
+
+  # legend range
+  range_max <- max(footprint(pressure_data))
+
+  # plot
+  g <- ggplot()
+  if (sensor_outline == TRUE) {
+    g <- g + geom_polygon(data = cor,
+                          aes(x = x, y = y, group = id, fill = value),
+                          color = "black")
+  } else {
+    g <- g + geom_polygon(data = cor,
+                          aes(x = x, y = y, group = id, fill = value))
+  }
+
+  g <- g + binned_scale("fill", "foo",
+                        binned_pal(manual_pal(break_colors)),
+                        guide = "coloursteps", breaks = break_values,
+                        #limits = c(0, max(cor$value)), show.limits = FALSE,
+                        limits = c(0, range_max), show.limits = FALSE,
+                        name = "Pressure (kPa)")
+  g <- g + scale_x_continuous(expand = c(0, 0), limits = c(0, x_lim))
+  g <- g + scale_y_continuous(expand = c(0, 0), limits = c(-0.02, y_lim))
+  g <- g + coord_fixed()
+
+  # add COP?
+  if (plot_COP == TRUE) {
+    cop_df <- cop(pressure_data)
+    g <- g + geom_point(data = cop_df, aes(x = x_coord, y = y_coord))
+  }
+
+  # add outline
+  if (plot_outline == TRUE) {
+    ch_out <- st_coordinates(pressure_outline(pressure_data))
+    ch_out <- as.data.frame(ch_out)[, c(1, 2)]
+    g <- g + geom_path(data = ch_out, aes(x = X, y = Y), colour = "black")
+    g <- g + geom_point(data = ch_out, aes(x = X, y = Y), colour = "purple")
+  }
+
+  # formatting
+  g <- g + theme_void()
+  g <- g + theme(panel.background = element_rect(fill = "white",
+                                                 colour = "white"),
+                 legend.box.spacing = unit(legend_spacing, "cm"))
+  if (legend == FALSE) {g <- g + theme(legend.position = "none")}
+
+  # display plot if requested
+  if (plot == TRUE) {print(g)}
+
+  # return ggplot object
+  return(g)
+}
+
+
+# =============================================================================
+
+#' @title Animate pressure
+#' @description Produces animation (gif) of pressure data
+#' @param pressure_data Array. A 3D array covering each timepoint of the
+#'   measurement. z dimension represents time
+#' @param plot_colors String
+#' @param fps Numeric. Number of frames per second in animation
+#' @param dpi Numeric. Resolution of gif
+#' @param file_name Name (inlcuding path) of export file
+#' @return Animation in gif format
+#' @examplesIf interactive()
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' animate_pressure(pressure_data, fps = 10, file_name = "testgif.gif")
+#' @importFrom stringr str_ends str_pad
+#' @importFrom magick image_graph image_animate image_write image_info
+#' image_read
+#' @importFrom ggplot2 ggplot aes geom_polygon scale_x_continuous
+#' scale_y_continuous coord_fixed theme_void xlim ylim ggsave
+#' @importFrom grDevices dev.off
+#' @importFrom utils txtProgressBar setTxtProgressBar
+#' @export
+
+animate_pressure <- function(pressure_data, plot_colors = "default", fps,
+                             dpi = 96, file_name) {
+  # parameter check
+  if (str_ends(file_name, ".gif") == FALSE)
+    stop("filename must end in .gif")
+
+  # max size of df
+  fp_max <- sensor_2_polygon(pressure_data, pressure_image = "all_active",
+                             output = "df")
+  x_lim <- max(fp_max$x)
+  y_lim <- max(fp_max$y)
+
+  # set up temp directory
+  temp_dir <- tempdir()
+
+  # number of frames
+  n_frames <- dim(pressure_data[[1]])[3]
+
+  # plot
+  img_fns <- rep(NA, length.out = n_frames)
+  pb <- txtProgressBar(min = 1, max = n_frames, style = 3)
+  message("processing images")
+  for (i in 1:n_frames) {
+    # make plot
+    g <- plot_pressure(pressure_data, variable = "frame", frame = i,
+                       plot_colors = plot_colors, plot = FALSE)
+    img_fn <- paste0(temp_dir, "/img", str_pad(i, nchar(n_frames),
+                                               pad = "0"), ".png")
+    ggsave(img_fn, g, width = 6.45, height = 5.77, dpi = dpi)
+    img_fns[i] <- img_fn
+    setTxtProgressBar(pb, i)
+  }
+
+  # update progress
+  close(pb)
+  message("generating and saving animation")
+
+  # load images back in
+  allInfo <- image_info(image_read(img_fns))
+  images <- image_read(img_fns)
+
+  # create animation
+  animation <- magick::image_animate(images, fps = fps)#, optimize = TRUE)
+
+  # save animation
+  magick::image_write(animation, file_name)
+  file.remove(img_fns)
+  invisible(gc())
+}
+
+
+# =============================================================================
+
+#' @title automask footprint
+#' @description Automatically creates mask of footprint data
+#' @param pressure_data List. First item is a 3D array covering each timepoint
+#' of the measurement. z dimension represents time
+#' @param foot_side String. "RIGHT", "LEFT", or "auto". Auto uses
+#' auto_detect_side function
+#' @param mask_scheme String.
+#' @param plot Logical. Whether to play the animation
+#' @return List. Masks are added to pressure data variable
+#' \itemize{
+#'   \item pressure_array. 3D array covering each timepoint of the measurement.
+#'            z dimension represents time
+#'   \item pressure_system. String defining pressure system
+#'   \item sens_size. Numeric vector with the dimensions of the sensors
+#'   \item time. Numeric value for time between measurements
+#'   \item masks. List
+#'   \item events. List
+#'  }
+#' @examples
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' pressure_data <- automask(pressure_data, foot_side = "auto", plot = TRUE)
+#' @importFrom zoo rollapply
+#' @importFrom sf st_union st_difference
+#' @export
+
+automask <- function(pressure_data, foot_side = "auto", mask_scheme,
+                     plot = FALSE) {
+  # check data isn't from pedar
+  if (pressure_data[[2]] == "pedar")
+    stop("automask doesn't work with pedar data")
+
+  # global variables
+  x <- y <- mask <- x_coord <- y_coord <- me <- heel_cut_dist <-
+    mfoot_cut_prox <- ffoot_cut_prox <- NULL
+
+  # Find footprint (max)
+  max_df <- footprint(pressure_data)
+
+  # coordinates
+  sens_coords <- sensor_coords(pressure_data)
+
+  # side
+  if (foot_side == "auto") {
+    side <- auto_detect_side(pressure_data)
+  } else {
+    side <- foot_side
+  }
+
+  # Define minimum bounding box
+  sens_coords_m <- as.matrix(sens_coords)
+  mbb <- getMinBBox(sens_coords_m)
+
+  # Define convex hull, expanding to include all sensors
+  df_sf <- sens_coords %>%
+    st_as_sf(coords = c( "x_coord", "y_coord" ))
+  fp_chull <- st_convex_hull(st_union(df_sf))
+  fp_chull <- st_buffer(fp_chull, pressure_data[[3]][1])
+
+  # Simple 3 mask (forefoot, midfoot, and hindfoot)
+  ## Bounding box sides
+  side1 <- mbb[c(1:2), ]
+  side2 <- mbb[c(3:4), ]
+
+  ## Get distal 27% and 55% lines that divide into masks
+  side1_27 <- side1[1, ] + ((side1[2, ] - side1[1, ]) * 0.27)
+  side2_27 <- side2[1, ] + ((side2[2, ] - side2[1, ]) * 0.27)
+  side1_55 <- side1[1, ] + ((side1[2, ] - side1[1, ]) * 0.55)
+  side2_55 <- side2[1, ] + ((side2[2, ] - side2[1, ]) * 0.55)
+  line_27_df <- rbind(side1_27, side2_27)
+  line_55_df <- rbind(side1_55, side2_55)
+  line_27 <- st_linestring(as.matrix(line_27_df))
+  line_27 <- st_extend_line(line_27, 1)
+  line_27_dist_poly <- st_line2polygon(line_27, 1, "+Y")
+  line_27_prox_poly <- st_line2polygon(line_27, 1, "-Y")
+  line_55 <- st_linestring(as.matrix(line_55_df))
+  line_55 <- st_extend_line(line_55, 1)
+  line_55_dist_poly <- st_line2polygon(line_55, 1, "+Y")
+  line_55_prox_poly <- st_line2polygon(line_55, 1, "-Y")
+
+  ## forefoot, midfoot, and hindfoot masks
+  hf_mask <- st_difference(fp_chull, line_27_dist_poly)
+  mf_mask <- st_difference(fp_chull, line_55_dist_poly)
+  mf_mask <- st_difference(mf_mask, line_27_prox_poly)
+  ff_mask <- st_difference(fp_chull, line_55_prox_poly)
+
+  # toe masks
+  ## toe line
+  toe_line_mat <- toe_line(pressure_data)
+
+  ## toe cut polygons
+  toe_poly_prox <- st_line2polygon(as.matrix(toe_line_mat), 1, "-Y")
+  toe_poly_dist <- st_line2polygon(as.matrix(toe_line_mat), 1, "+Y")
+
+  ## make masks
+  toe_mask <- st_difference(fp_chull, toe_poly_prox)
+  ff_mask <- st_difference(ff_mask, toe_poly_dist)
+
+  # Define angles for dividing lines between metatarsals
+  ## get edge lines
+  edges <- edge_lines(pressure_data, side)
+
+  ## angle between lines
+  med_pts <- st_coordinates(edges[[1]])
+  lat_pts <- st_coordinates(edges[[2]])
+  med_line_angle <- (atan((med_pts[2, 1] - med_pts[1, 1]) /
+                                 (med_pts[2, 2] - med_pts[1, 2]))) * 180 / pi
+  lat_line_angle <- (atan((lat_pts[2, 1] - lat_pts[1, 1]) /
+                                 (lat_pts[2, 2] - lat_pts[1, 2]))) * 180 / pi
+  alpha <- lat_line_angle - med_line_angle
+
+
+  ## intersection point
+  med_lat_int <- st_intersection(edges[[1]], edges[[2]])
+
+  ## rotation angles for 2-4 lines
+  MT_hx_alpha <- (0.33 * alpha)
+  MT_12_alpha <- (0.3  * alpha)
+  MT_23_alpha <- (0.47 * alpha)
+  MT_34_alpha <- (0.64 * alpha)
+  MT_45_alpha <- (0.81 * alpha)
+
+  ## polys for met and hal cuts
+  if (side == "RIGHT") {lat_dir <- "+X"; med_dir <- "-X"}
+  if (side == "LEFT") {lat_dir <- "-X"; med_dir <- "+X"}
+  MT_hx_line <- rot_line(edges[[1]], MT_hx_alpha, med_lat_int)
+  MT_hx_poly_lat <- st_line2polygon(st_coordinates(MT_hx_line)[, 1:2], 1, lat_dir)
+  MT_hx_poly_med <- st_line2polygon(st_coordinates(MT_hx_line)[, 1:2], 1, med_dir)
+  MT_12_line <- rot_line(edges[[1]], MT_12_alpha, med_lat_int)
+  MT_12_poly_lat <- st_line2polygon(st_coordinates(MT_12_line)[, 1:2], 1, lat_dir)
+  MT_12_poly_med <- st_line2polygon(st_coordinates(MT_12_line)[, 1:2], 1, med_dir)
+  MT_23_line <- rot_line(edges[[1]], MT_23_alpha, med_lat_int)
+  MT_23_poly_lat <- st_line2polygon(st_coordinates(MT_23_line)[, 1:2], 1, lat_dir)
+  MT_23_poly_med <- st_line2polygon(st_coordinates(MT_23_line)[, 1:2], 1, med_dir)
+  MT_34_line <- rot_line(edges[[1]], MT_34_alpha, med_lat_int)
+  MT_34_poly_lat <- st_line2polygon(st_coordinates(MT_34_line)[, 1:2], 1, lat_dir)
+  MT_34_poly_med <- st_line2polygon(st_coordinates(MT_34_line)[, 1:2], 1, med_dir)
+  MT_45_line <- rot_line(edges[[1]], MT_45_alpha, med_lat_int)
+  MT_45_poly_lat <- st_line2polygon(st_coordinates(MT_45_line)[, 1:2], 1, lat_dir)
+  MT_45_poly_med <- st_line2polygon(st_coordinates(MT_45_line)[, 1:2], 1, med_dir)
+
+  ## make met masks
+  hal_mask <- st_difference(toe_mask, MT_hx_poly_lat)
+  l_toe_mask <- st_difference(toe_mask, MT_hx_poly_med)
+  MT1_mask <- st_difference(ff_mask, MT_12_poly_lat)
+  MT2_mask <- st_difference(ff_mask, MT_23_poly_lat)
+  MT2_mask <- st_difference(MT2_mask, MT_12_poly_med)
+  MT3_mask <- st_difference(ff_mask, MT_34_poly_lat)
+  MT3_mask <- st_difference(MT3_mask, MT_23_poly_med)
+  MT4_mask <- st_difference(ff_mask, MT_45_poly_lat)
+  MT4_mask <- st_difference(MT4_mask, MT_34_poly_med)
+  MT5_mask <- st_difference(ff_mask, MT_45_poly_med)
+
+  # Make mask list
+  mask_list <- list(heel_mask = hf_mask,
+                    midfoot_mask = mf_mask,
+                    forefoot_mask = ff_mask,
+                    hal_mask = hal_mask,
+                    l_toe_mask = l_toe_mask,
+                    MT1_mask = MT1_mask,
+                    MT2_mask = MT2_mask,
+                    MT3_mask = MT3_mask,
+                    MT4_mask = MT4_mask,
+                    MT5_mask = MT5_mask)
+
+
+  # Plot Footprint and masks if required
+  if (plot == TRUE) {
+    # make masks into df format
+    mask_df <- masks_2_df(mask_list)
+
+    # Plot footprint and masks
+    g <- plot_pressure(pressure_data, "max", plot = FALSE)
+    g <- g + scale_x_continuous(expand = c(0, 0), limits = c(-0.01, 0.15))
+    g <- g + scale_y_continuous(expand = c(0, 0), limits = c(-0.01, 0.30))
+    g <- g + geom_path(data = mask_df, aes(x = x, y = y, group = mask),
+                       color = "red", linewidth = 1)
+    suppressMessages(print(g))
+  }
+
+  # Return masks for analysis
+  pressure_data[[5]] <- mask_list
+  return(pressure_data)
+}
+
+
+# =============================================================================
+
+#' @title Create mask
+#' @description Allows user to manually define mask region
+#' @param pressure_data List. First item is a 3D array covering each timepoint
+#' of the measurement.
+#' @param n_verts Numeric. Number of vertices in mask
+#' @param n_masks Numeric. Number of masks to add
+#' @param threshold Numeric. Distance between adjacent mask vertices before
+#' sharing vertex coordinates
+#' @param plot_existing_mask Logical. Show existing masks
+#' @param image String."max" = footprint of maximum sensors. "mean"
+#' average value of sensors over time
+#' @param mask_names List. Mask names. Default is "custom_mask#"
+#' @param preview Logical. Show new maks on pressure image
+#' @return List. Mask(s) are added to pressure data variable
+#' \itemize{
+#'   \item pressure_array. 3D array covering each timepoint of the measurement.
+#'            z dimension represents time
+#'   \item pressure_system. String defining pressure system
+#'   \item sens_size. Numeric vector with the dimensions of the sensors
+#'   \item time. Numeric value for time between measurements
+#'   \item masks. List
+#'   \item events. List
+#'  }
+#' @examplesIf interactive()
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' pressure_data <- create_mask(pressure_data, n_verts = 4, n_masks = 1,
+#' threshold = 0.005, plot_existing_mask = TRUE,
+#' image = "max", mask_names = c("default"), preview = TRUE)
+#' @importFrom grDevices x11
+#' @importFrom ggmap gglocator
+#' @importFrom ggplot2 aes geom_path
+#' @importFrom sf st_polygon
+#' @export
+
+create_mask <- function(pressure_data, n_verts = 4, n_masks = 1,
+                        threshold = 0.005, plot_existing_mask = TRUE,
+                        image = "max", mask_names = c("default"), preview = TRUE) {
+  # global variables
+  x <- y <- NULL
+
+  # empty data frame to store vertex coordinates
+  mask_vertices <- data.frame(x = double(), y = double())
+
+  # check session is interactive
+  if (interactive() == FALSE){stop("user needs to select mask vertices")}
+
+  # plot existing masks or just footprint
+  if (plot_existing_mask == TRUE & length(pressure_data[[5]]) > 0) {
+    g <- plot_masks(pressure_data, image = image)
+    for(mask_idx in 1:length(pressure_data[[5]])){
+      mask_coord <- st_coordinates(pressure_data[[5]][[mask_idx]])[,1:2]
+      mask_vertices[(nrow(mask_vertices)+1):(nrow(mask_vertices)+nrow(mask_coord)),] <-
+        mask_coord
+    }
+  } else {
+    grDevices::x11()
+    g <- plot_pressure(pressure_data, image, plot = FALSE)
+    g <- g + scale_x_continuous(expand = c(0, 0), limits = c(-0.01, 0.15))
+    g <- g + scale_y_continuous(expand = c(0, 0), limits = c(-0.01, 0.30))
+    print(g)
+  }
+
+
+  mask_list <- pressure_data[[5]]
+  n_exist_mask <- length(pressure_data[[5]])
+
+  for(mask_n in 1:n_masks){
+    # interactively select area
+    message("Select mask corners")
+    if(n_verts > 2){
+       mask <- gglocator(n_verts)
+    }else{
+      stop("Masks must contain at least three vertices to make a polygon")
+    }
+
+    valid_mask <- which(dist(mask) < threshold)
+
+    while(length(valid_mask) > 0){
+      message("Some vertices are closer than your designated threshold.
+              Reselect mask corners")
+      mask <- gglocator(n_verts)
+      valid_mask <- which(dist(mask) < threshold)
+    }
+
+    # allow closely selected mask vertices to share a vertex
+    mask_vertices[(nrow(mask_vertices) + 1):
+                    (nrow(mask_vertices) + n_verts), ] <- mask
+    if (nrow(mask_vertices) > n_verts) {
+      v_distance <- as.matrix(dist(mask_vertices))
+      for (change_v in 0:(n_verts-1)) {
+        close_v <- which((v_distance[nrow(mask_vertices)- change_v, ] < threshold) &
+                           (v_distance[nrow(mask_vertices)- change_v, ] > 0), arr.ind = TRUE)
+        if(length(close_v) > 0){
+          mask[n_verts - change_v, ] <- mask_vertices[close_v[1], ]
+        }
+
+      }
+    }
+
+    mask <- data.frame(x = mask[, 1], y = mask[, 2])
+    mask <- mask[c(1:nrow(mask), 1), ]
+
+    # preview
+    if (preview == TRUE) {
+      g <- g + geom_path(data = mask, aes(x, y), color = "blue", linewidth = 1)
+      print(g)
+    }
+
+    # mask to polygon
+    mask_pol <- st_polygon(list(as.matrix(mask)))
+
+    # update mask list
+    mask_list[[length(mask_list) + 1]] <- mask_pol
+
+  }
+
+  pressure_data[[5]] <- mask_list
+
+  # add labels
+  if (mask_names[1] == "default" & length(mask_names) == 1){
+
+    names(pressure_data[[5]])[(n_exist_mask+1):(n_masks+n_exist_mask)] <- sprintf("custom_mask%d", seq(1,n_masks))
+  } else {
+    names(pressure_data[[5]])[(n_exist_mask+1):(n_masks+n_exist_mask)] <- mask_names
+  }
+
+  # return pressure frames for selected area
+  return(pressure_data)
+}
+
+
+# =============================================================================
+
+#' @title Edit mask
+#' @description Allows user to manually adjust mask vertices
+#' @param pressure_data List. First item is a 3D array covering each timepoint
+#' of the measurement.
+#' @param n_edit Numeric. Number of vertices to edit
+#' @param threshold Numeric. Distance between point clicked and vertex that is
+#' selected
+#' @param edit_list List. Mask numbers that want to be edited. (Default is to
+#' load all masks so that adjacent masks with shared coordinates are modified
+#' together)
+#' @param image String."max" = footprint of maximum sensors. "mean"
+#' average value of sensors over time
+#' @return List. Edited mask is added to the pressure data variable
+#' \itemize{
+#'   \item pressure_array. 3D array covering each timepoint of the measurement.
+#'            z dimension represents time
+#'   \item pressure_system. String defining pressure system
+#'   \item sens_size. Numeric vector with the dimensions of the sensors
+#'   \item time. Numeric value for time between measurements
+#'   \item masks. List
+#'   \item events. List
+#'  }
+#' @examplesIf interactive()
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' pressure_data <- automask(pressure_data, foot_side = "auto", plot = TRUE)
+#' pressure_data <- edit_mask(pressure_data, n_edit = 1, threshold = 0.002,
+#'   edit_list = seq(1,length(pressure_data[[5]])), image = "max")
+#' @importFrom grDevices rainbow
+#' @export
+
+edit_mask <- function(pressure_data, n_edit, threshold = 0.002,
+                      edit_list = seq(1,length(pressure_data[[5]])),
+                      image = "max") {
+  # check session is interactive
+  if (interactive() == FALSE) {stop("user needs to select mask vertices")}
+
+  # global variables
+  X <- Y <- NULL
+
+  if (n_edit > 0) {
+    # plot original mask data
+    g <- plot_masks(pressure_data, image = image)
+
+    # compile all mask vertices
+    mask_org <- pressure_data[[5]]
+    mask_vertices_edit <- data.frame(x = double(), y = double())
+
+    for (n_mask in edit_list) {
+      mask_vertices <- data.frame(st_coordinates(mask_org[[n_mask]])[,1:2])
+      mask_vertices_edit[(nrow(mask_vertices_edit) + 1):
+                           (nrow(mask_vertices) + nrow(mask_vertices_edit)), ] <- mask_vertices
+    }
+
+    # select point near edit vertex and select new value
+    color_v <- rainbow(n_edit + 1)
+    for (edit in seq(1, n_edit)){
+      message("Select mask vertex to edit, then it's new location")
+      mask <- gglocator(2)
+      mask_vertices_edit[nrow(mask_vertices_edit) + 1, ] <- mask[1, ]
+      edit_distance <- as.matrix(dist(mask_vertices_edit))
+      close_v <-
+        which((edit_distance[nrow(mask_vertices_edit),] < threshold) &
+                (edit_distance[nrow(mask_vertices_edit),] > 0), arr.ind = TRUE)
+
+      while (length(close_v) == 0) {
+        message("The point selected isn't close to any existing vertex, try again")
+        mask <- gglocator(2)
+        mask_vertices_edit[nrow(mask_vertices_edit) + 1, ] <- mask[1,]
+        edit_distance <- as.matrix(dist(mask_vertices_edit))
+        close_v <-
+          which((edit_distance[nrow(mask_vertices_edit),] < threshold) &
+                  (edit_distance[nrow(mask_vertices_edit),] > 0), arr.ind = TRUE)
+      }
+
+      for (n_mask in edit_list) {
+        mask_vertices <- data.frame(st_coordinates(mask_org[[n_mask]])[, 1:2])
+        new_mask_v <- mask_vertices
+        mask_vertices[nrow(mask_vertices) + 1, ] <- mask[1, ]
+        v_distance <- as.matrix(dist(mask_vertices))
+        close_selected <- which((v_distance[nrow(mask_vertices), ] < threshold)
+                                 & (v_distance[nrow(mask_vertices), ] > 0),
+                                arr.ind = TRUE)
+
+        if (length(close_selected) > 0){
+
+          if(close_selected[1] == 1){
+            new_mask_v[c(1, nrow(new_mask_v)), ] <- mask[2, ]
+            close_selected <- head(close_selected[-1], -1)
+          }
+          if(length(close_selected) > 0){
+            new_mask_v[close_selected[1], ] <- mask[2, ]
+            if(length(close_selected) > 1){
+              new_mask_v <- new_mask_v[-tail(close_selected, -1), ]
+            }
+          }
+
+          g <- g + geom_path(data = new_mask_v, aes(X, Y), color = color_v[edit + 1],
+                             linewidth = 1)
+          mask_org[[n_mask]] <-
+            st_polygon(list(as.matrix(new_mask_v)))
+        }
+      }
+
+      print(g)
+    }
+
+    # return pressure frames for selected area
+    pressure_data[[5]] <- mask_org
+    return(pressure_data)
+  } else {
+    message("You must edit at least one vertex, change the value for 'n_edit'")
+  }
+}
+
+
+# =============================================================================
+
+#' @title Pedar mask template
+#' @description Add a Pedar mask template using 3 in current literature
+#' @author Scott Telfer \email{scott.telfer@gmail.com}
+#' @param pressure_data List. First item is a 3D array covering each timepoint
+#' of the measurement.
+#' @param mask_type String. Note, we refer to rearfoot as hindfoot
+#' "mask1" splits the insole into 4 regions using sensel boundaries:
+#' hindfoot, midfoot, forefoot, and toes-- https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9470545/
+#' "mask2" splits the insole into 4 regions using percentages:
+#' hindfoot, forefoot, hallux, and lesser toes-- https://jfootankleres.biomedcentral.com/articles/10.1186/1757-1146-7-18
+#' "mask3" splits the foot into 9 regions using sensel boundaries:
+#'  medial hindfoot, lateral hindfoot, medial midfoot, lateral midfoot, MTPJ1,
+#'  MTPJ2-3, MTPJ4-5, hallux, and lesser toes-- https://jfootankleres.biomedcentral.com/articles/10.1186/1757-1146-7-20
+#' "custom" allows you to select a mask region
+#' @param n_sensors Numeric. Number of sensors in the custom mask region. Custom
+#' masks will be added to the end of the existing list of masks.
+#' @param plot Logical. Plot masks if TRUE
+#' @param image String."max" = footprint of maximum sensors. Or numeric for a
+#' specified frame number
+#' @param mask_name String. Add names to custom masks
+#' @return List. Masks are added to the relevant A 3D array covering each
+#' timepoint of the measurement for the selected region. z dimension represents
+#' time
+#' @examplesIf interactive()
+#' pedar_data <- system.file("extdata", "pedar_example.asc", package = "pressuRe")
+#' pressure_data <- load_pedar(pedar_data)
+#' pressure_data <- pedar_mask(pressure_data, "mask3")
+#' @importFrom sf st_union st_difference st_bbox st_point
+#' @importFrom grDevices graphics.off
+#' @export
+
+pedar_mask <- function(pressure_data, mask_type, n_sensors = 1, image = "max",
+                       mask_name = "custom_mask",plot = TRUE) {
+  # set global variables
+  pedar_insole_grid <- x <- y <- id <- position <- NULL
+
+  # check this is pedar (or other suitable) data
+  if (pressure_data[[2]] != "pedar")
+    stop("data should be from pedar")
+
+  # pedar insole grid
+  pedar_insole_grid <- pedar_insole_grids()
+
+  # defines the sensels or percentages for masking
+  if (mask_type == "mask1") {
+    # define masks by sensel number
+    hindfoot_L <- pedar_polygon(pressure_data, 1:26, "LEFT")
+    midfoot_L <-pedar_polygon(pressure_data, 27:54, "LEFT")
+    forefoot_L <- pedar_polygon(pressure_data, 55:82, "LEFT")
+    toes_L <- pedar_polygon(pressure_data, 83:99, "LEFT")
+
+    hindfoot_R <- pedar_polygon(pressure_data, 1:26, "RIGHT")
+    midfoot_R <-pedar_polygon(pressure_data, 27:54, "RIGHT")
+    forefoot_R <- pedar_polygon(pressure_data, 55:82, "RIGHT")
+    toes_R <- pedar_polygon(pressure_data, 83:99, "RIGHT")
+
+    mask_list <- list(L_hindfoot_mask = hindfoot_L,
+                      L_midfoot_mask = midfoot_L,
+                      L_forefoot_mask = forefoot_L,
+                      L_toes_mask = toes_L,
+                      R_hindfoot_mask = hindfoot_R,
+                      R_midfoot_mask = midfoot_R,
+                      R_forefoot_mask = forefoot_R,
+                      R_toes_mask = toes_R)
+
+    pressure_data[[5]] <- mask_list
+
+  } else if (mask_type == "mask2") {
+    # foot outline and bounding box
+    bbox_L <- sf::st_bbox(pedar_polygon(pressure_data, 1:99, "LEFT"))
+    outline_mask <- pedar_polygon(pressure_data, 1:99, "LEFT")
+
+    # define percent lines
+    hindfoot_line_Ly <- (bbox_L$ymax - bbox_L$ymin) / 2 + bbox_L$ymin
+    forefoot_line_Ly <- (bbox_L$ymax - bbox_L$ymin) * 0.85 + bbox_L$ymin
+    hallux_line_Lx <- bbox_L$xmax - (bbox_L$xmax - bbox_L$xmin) * 0.35
+
+    # define masks
+    hindfoot_line_L <- data.frame(x_coord = c(bbox_L$xmin, bbox_L$xmax),
+                                  y_coord =  c(hindfoot_line_Ly, hindfoot_line_Ly))
+    hindfoot_line_L <- st_extend_line(st_linestring(as.matrix(hindfoot_line_L)), 1)
+    hindfoot_line_L_dist <- st_line2polygon(hindfoot_line_L, 1, "+Y")
+    hindfoot_L <- st_difference(outline_mask, hindfoot_line_L_dist)
+
+    forefoot_line_L <- data.frame(x_coord = c(bbox_L$xmin,bbox_L$xmax),
+                                  y_coord =  c(forefoot_line_Ly,forefoot_line_Ly))
+    forefoot_line_L <- st_extend_line(st_linestring(as.matrix(forefoot_line_L)),1)
+    forefoot_line_L_dist <- st_line2polygon(forefoot_line_L, 1, "+Y")
+    forefoot_line_L_prox <- st_line2polygon(forefoot_line_L, 1, "-Y")
+    forefoot_L <- st_difference(outline_mask, forefoot_line_L_dist)
+
+    toes_L <- st_difference(outline_mask, forefoot_line_L_prox)
+    hallux_line_L <- data.frame(x_coord = c(hallux_line_Lx,hallux_line_Lx),
+                                y_coord =  c(bbox_L$ymin,bbox_L$ymax))
+    hallux_line_L <- st_extend_line(st_linestring(as.matrix(hallux_line_L)),1)
+    hallux_line_L_lat <- st_line2polygon(hallux_line_L, 1, "-X")
+    hallux_line_L_med <- st_line2polygon(hallux_line_L, 1, "+X")
+    hallux_L <- st_difference(toes_L, hallux_line_L_lat)
+    lesser_toes_L <- st_difference(toes_L, hallux_line_L_med)
+
+    bbox_R <- sf::st_bbox(pedar_polygon(pressure_data, 1:99, "RIGHT"))
+    outline_mask <- pedar_polygon(pressure_data, 1:99, "RIGHT")
+
+    hindfoot_line_Ry <- (bbox_R$ymax - bbox_R$ymin) / 2 + bbox_R$ymin
+    forefoot_line_Ry <- (bbox_R$ymax - bbox_R$ymin) * 0.85 + bbox_R$ymin
+    hallux_line_Rx <- bbox_R$xmin + (bbox_R$xmax - bbox_R$xmin) * 0.35
+
+    hindfoot_line_R <- data.frame(x_coord = c(bbox_R$xmin, bbox_R$xmax),
+                                  y_coord =  c(hindfoot_line_Ry, hindfoot_line_Ry))
+    hindfoot_line_R <- st_extend_line(st_linestring(as.matrix(hindfoot_line_R)), 1)
+    hindfoot_line_R_dist <- st_line2polygon(hindfoot_line_R, 1, "+Y")
+    hindfoot_R <- st_difference(outline_mask, hindfoot_line_R_dist)
+
+    forefoot_line_R <- data.frame(x_coord = c(bbox_R$xmin, bbox_R$xmax),
+                                  y_coord =  c(forefoot_line_Ry, forefoot_line_Ry))
+    forefoot_line_R <- st_extend_line(st_linestring(as.matrix(forefoot_line_R)), 1)
+    forefoot_line_R_dist <- st_line2polygon(forefoot_line_R, 1, "+Y")
+    forefoot_line_R_prox <- st_line2polygon(forefoot_line_R, 1, "-Y")
+    forefoot_R <- st_difference(outline_mask, forefoot_line_R_dist)
+
+    toes_R <- st_difference(outline_mask, forefoot_line_R_prox)
+    hallux_line_R <- data.frame(x_coord = c(hallux_line_Rx, hallux_line_Rx),
+                                y_coord =  c(bbox_R$ymin, bbox_R$ymax))
+    hallux_line_R <- st_extend_line(st_linestring(as.matrix(hallux_line_R)), 1)
+    hallux_line_R_lat <- st_line2polygon(hallux_line_R, 1, "+X")
+    hallux_line_R_med <- st_line2polygon(hallux_line_R, 1, "-X")
+    hallux_R <- st_difference(toes_R, hallux_line_R_lat)
+    lesser_toes_R <- st_difference(toes_R, hallux_line_R_med)
+
+    mask_list <- list(L_hindfoot_mask = hindfoot_L,
+                      L_forefoot_mask = forefoot_L,
+                      L_hallux_mask = hallux_L,
+                      L_lesser_toes_mask = lesser_toes_L,
+                      R_hindfoot_mask = hindfoot_R,
+                      R_forefoot_mask = forefoot_R,
+                      R_hallux_mask = hallux_R,
+                      R_lesser_toes_mask = lesser_toes_R)
+
+    pressure_data[[5]] <- mask_list
+  } else if (mask_type == "mask3"){
+    # define masks by sensel numbers
+    med_rf_L <- pedar_polygon(pressure_data, c(1:2, 6:8, 13:15, 20:22), "LEFT")
+    lat_rf_L <-pedar_polygon(pressure_data, c(9:12, 16:19, 23:26), "LEFT")
+    med_mf_L <- pedar_polygon(pressure_data, c(27:29, 34:36, 41:43, 48:50, 55:57), "LEFT")
+    lat_mf_L <- pedar_polygon(pressure_data, c(30:33, 37:40, 44:47, 51:54, 58:59), "LEFT")
+    MTPJ1_L <- pedar_polygon(pressure_data, c(62:63, 69:70, 76:77), "LEFT")
+    MTPJ23_L <- pedar_polygon(pressure_data, c(64:66, 71:73, 78:80), "LEFT")
+    MTPJ45_L <- pedar_polygon(pressure_data, c(60:61, 67:68, 74:75), "LEFT")
+    hallux_L <- pedar_polygon(pressure_data, c(83:84, 90:91, 96), "LEFT")
+    lesser_toes_L <- pedar_polygon(pressure_data, c(81:82, 89:85, 92:85, 87:99), "LEFT")
+
+    med_rf_R <- pedar_polygon(pressure_data, c(1:2, 6:8, 13:15, 20:22), "RIGHT")
+    lat_rf_R <-pedar_polygon(pressure_data, c(9:12, 16:19, 23:26), "RIGHT")
+    med_mf_R <- pedar_polygon(pressure_data, c(27:29, 34:36, 41:43, 48:50, 55:57), "RIGHT")
+    lat_mf_R <- pedar_polygon(pressure_data, c(30:33, 37:40, 44:47, 51:54, 58:59), "RIGHT")
+    MTPJ1_R <- pedar_polygon(pressure_data, c(62:63, 69:70, 76:77), "RIGHT")
+    MTPJ23_R <- pedar_polygon(pressure_data, c(64:66, 71:73, 78:80), "RIGHT")
+    MTPJ45_R <- pedar_polygon(pressure_data, c(60:61, 67:68, 74:75), "RIGHT")
+    hallux_R <- pedar_polygon(pressure_data, c(83:84, 90:91, 96), "RIGHT")
+    lesser_toes_R <- pedar_polygon(pressure_data, c(81:82, 89:85, 92:85, 87:99), "RIGHT")
+
+    mask_list <- list(L_medial_hindfoot_mask = med_rf_L,
+                      L_lateral_hindfoot_mask = lat_rf_L,
+                      L_medial_midfoot_mask = med_mf_L,
+                      L_lateral_midfoot_mask = lat_mf_L,
+                      L_MTPJ1_mask = MTPJ1_L,
+                      L_MTPJ23_mask = MTPJ23_L,
+                      L_MTPJ45_mask = MTPJ45_L,
+                      L_hallux_mask = hallux_L,
+                      L_lesser_toes_mask = lesser_toes_L,
+                      R_medial_hindfoot_mask = med_rf_R,
+                      R_lateral_hindfoot_mask = lat_rf_R,
+                      R_medial_midfoot_mask = med_mf_R,
+                      R_lateral_midfoot_mask = lat_mf_R,
+                      R_MTPJ1_mask = MTPJ1_R,
+                      R_MTPJ23_mask = MTPJ23_R,
+                      R_MTPJ45_mask = MTPJ45_R,
+                      R_hallux_mask = hallux_R,
+                      R_lesser_toes_mask = lesser_toes_R)
+    pressure_data[[5]] <- mask_list
+  } else if (mask_type == "custom") {
+    # plot existing masks or pressure data
+    if (length(pressure_data[[5]]) == 0) {
+      grDevices::x11()
+      g <- plot_pressure(pressure_data, variable = image, plot = TRUE)
+    } else {
+      g <- plot_masks(pressure_data, image = "max")
+    }
+
+    # selection of sensors
+    message(paste0("Select ", n_sensors, " sensors to define your custom mask"))
+    sensor_pts <- gglocator(n_sensors)
+    sensor_polygons <- sensor_2_polygon(pressure_data, pressure_image = "all_active",
+                                        frame = NA, output = "sf")
+    sensor_list <- c()
+
+    # find point in sensor polygons
+    for(pts in 1:n_sensors){
+      point <- sf::st_point(c(sensor_pts[pts,1],sensor_pts[pts,2]))
+      for (sensor_idx in 1:198) {
+        if (length(st_intersects(sensor_polygons[[sensor_idx]], point)[[1]]) == 1) {
+
+          if (sensor_idx > 99) {
+            foot_side <- "LEFT"
+            sensor_list <- c(sensor_list, sensor_idx)
+          } else {
+            foot_side <- "RIGHT"
+            sensor_list <- c(sensor_list, sensor_idx+99)
+          }
+        }
+      }
+    }
+
+
+    if (length(sensor_list) != n_sensors) {
+      message("Note: the number of sensors selected is not equal to the number
+              intially defined")
+    }
+
+    # build custom mask
+    custom_mask <- pedar_polygon(pressure_data, sensor_list, foot_side)
+
+    # update mask list
+    mask_list <- pressure_data[[5]]
+    mask_list[[length(mask_list) + 1]] <- custom_mask
+    pressure_data[[5]] <- mask_list
+    names(pressure_data[[5]][[length(mask_list)]]) <- mask_name
+    graphics.off()
+  } else {
+    stop("Please select an existing mask")
+  }
+
+  # plot
+  if (plot == TRUE) {
+    if(image == "max"){
+       plot_masks(pressure_data, image = "max")
+    }else if(is.numeric(image)){
+      plot_masks(pressure_data, image = image)
+    }
+
+  }
+
+  # return
+  return(pressure_data)
+}
+
+
+# =============================================================================
+
+#' @title CPEI
+#' @description Determine Center of Pressure Excursion Index (CPEI) for
+#' footprint pressure data
+#' @author Scott Telfer \email{scott.telfer@gmail.com}
+#' @param pressure_data List. First item is a 3D array covering each timepoint
+#' of the measurement. Not currently available for pedar.
+#' @param foot_side String. "right" or "left". Required for automatic detection of
+#'   points
+#' @param plot_result Logical. Plots pressure image with COP and CPEI overlaid
+#' @return Numeric. CPEI value
+#' @examplesIf interactive()
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' cpei(pressure_data, foot_side = "auto", plot = TRUE)
+#' @importFrom sf st_convex_hull st_linestring st_distance st_coordinates
+#' @importFrom dplyr pull summarise
+#' @export
+
+cpei <- function(pressure_data, foot_side, plot_result = TRUE) {
+  # check set up
+  if (interactive() == FALSE)
+    stop("we recommend user reviews each measurement")
+
+  # global variables
+  x <- y <- me <- X <- Y <- NULL
+
+  # side
+  if (foot_side == "auto") {
+    side <- auto_detect_side(pressure_data)
+  } else {
+    side <- foot_side
+  }
+
+  # footprint coordinates
+  sc_df <- sensor_2_polygon(pressure_data, output = "df")[, c(1, 2)]
+  sc_df <- sc_df[!duplicated(sc_df), ]
+
+  # determine medial line
+  ## medial edge coords
+  unq_y <- unique(sc_df$y)
+  med_edge <- data.frame(x = rep(NA, length.out = length(unq_y)),
+                         y = unq_y)
+  for (i in 1:length(unq_y)) {
+    if (side == "LEFT") {
+      med_edge[i, 1] <- sc_df %>% filter(y == unq_y[i]) %>%
+        summarise(me = max(x)) %>% pull(me)
+    } else {
+      med_edge[i, 1] <- sc_df %>% filter(y == unq_y[i]) %>%
+        summarise(me = min(x)) %>% pull(me)
+    }
+  }
+
+  ## convex hull of medial edge
+  med_edge_sf <- med_edge %>% st_as_sf(coords = c("x", "y"))
+  med_edge_chull <- st_convex_hull(st_combine(med_edge_sf))
+
+  ## longest med edge line
+  me_dis <- as.matrix(dist(st_coordinates(med_edge_chull)))
+  me_dis <- me_dis[row(me_dis) == (col(me_dis) - 1)]
+  me_max <- order(me_dis)[length(me_dis)]
+  med_side <- st_coordinates(med_edge_chull)[c(me_max, me_max + 1), c(1, 2)]
+  med_side_line <- st_linestring(med_side)
+  med_side_line <- st_extend_line(med_side_line, 0.1)
+
+  ## confirm no points to medial side of line
+
+
+  # bounding box for whole foot
+  ## Bounding box
+  mbb <- getMinBBox(as.matrix(sc_df))
+  side1 <- mbb[c(1:2), ]
+  side2 <- mbb[c(3:4), ]
+
+  ## Get distal trisection points and make line
+  trisection_left <- side2[1, ] + ((side2[2, ] - side2[1, ]) * 0.667)
+  trisection_right <- side1[1, ] + ((side1[2, ] - side1[1, ]) * 0.667)
+  trisection_df <- data.frame(x = c(trisection_left[1], trisection_right[1]),
+                              y = c(trisection_left[2], trisection_right[2]))
+  tri_line <- st_linestring(as.matrix(trisection_df))
+  tri_line <- st_extend_line(tri_line, 1)
+  #tri_int <- st_intersection(st_cast(fp_chull, "MULTILINESTRING"), tri_line)
+
+  # trisection of medial line
+  med_edge_tri_pt <- st_intersection(med_side_line, tri_line)
+
+  # perp med line
+  med_slope <- (med_side_line[2, 2] - med_side_line[1, 2]) /
+                 (med_side_line[2, 1] - med_side_line[1, 1])
+  perp_med_line_slope <- -1 / med_slope
+  tri_med_int <- med_edge_tri_pt[2] - (perp_med_line_slope * med_edge_tri_pt[1])
+  perp_med_line <- rbind(med_edge_tri_pt, c(0, tri_med_int))
+  perp_med_line <- st_extend_line(st_linestring(perp_med_line), 0.2)
+
+  # ff width
+  ## convex hull
+  df.sf <- sc_df %>%
+    st_as_sf(coords = c( "x", "y" ))
+  fp_chull <- st_convex_hull(st_combine(df.sf))
+  ff_lat_int <- st_intersection(fp_chull, perp_med_line)
+  ff_lat_int <- st_coordinates(ff_lat_int)[, c(1, 2)]
+  if (side == "RIGHT") {
+    ff_lat_int <- ff_lat_int[which.max(ff_lat_int[, 1]), ]
+  } else {
+    ff_lat_int <- ff_lat_int[which.min(ff_lat_int[, 1]), ]
+  }
+  ff_width_pts <- rbind(ff_lat_int, st_coordinates(med_edge_tri_pt))
+  ff_width <- as.numeric(unname(dist(ff_width_pts)))
+
+  # cop_line
+  cop_df <- cop(pressure_data)
+  cop_sf <- cop_df %>%
+    st_as_sf(coords = c("x_coord", "y_coord"))
+  cop_chull <- st_convex_hull(st_combine(cop_sf))
+
+  # cop_straight
+  cop_dis <- as.matrix(dist(st_coordinates(cop_chull)))
+  cop_dis <- cop_dis[row(cop_dis) == (col(cop_dis) - 1)]
+  cop_max <- order(cop_dis)[length(cop_dis)]
+  cop_side <- st_coordinates(cop_chull)[c(cop_max, cop_max + 1), c(1, 2)]
+  cop_side_line <- st_linestring(cop_side)
+  cop_side_line <- st_extend_line(cop_side_line, 0.1)
+
+  # cross point cop and per_med_line
+  cop1_per_med_pt <- st_intersection(st_linestring(as.matrix(cop_df)),
+                                     perp_med_line)
+
+  # cross point cop straight and per_med_line
+  cop2_per_med_pt <- st_intersection(cop_side_line, perp_med_line)
+
+  # CPE distance
+  CPE <- as.numeric(unname(st_distance(cop1_per_med_pt, cop2_per_med_pt)))
+
+  # calculate CPEI
+  CPEI <- (CPE / ff_width) * 100
+
+  # plot
+  if (plot_result == TRUE) {
+    # make CPEI dfs for plotting
+    med_side_df <- as.data.frame(med_side)
+    cop_side_df <- as.data.frame(cop_side)
+    cpe_df <- as.data.frame(rbind(cop1_per_med_pt, cop2_per_med_pt))
+    colnames(cpe_df) <- c("X", "Y")
+
+    # plot
+    g <- plot_pressure(pressure_data, plot_colors = "custom",
+                       break_values = c(100, 750),
+                       break_colors = c("lightgrey", "grey", "darkgrey"),
+                       plot_COP = TRUE)
+    g <- g + geom_line(data = med_side_df, aes(X, Y), linetype = "dashed",
+                       color = "black", size = 1.5)
+    g <- g + geom_line(data = cpe_df, aes(X, Y), color = "black",
+                       size = 2)
+    g <- g + geom_line(data = cop_side_df, aes(X, Y), colour = "blue",
+                       alpha = 0.8)
+    print(g)
+  }
+
+  # manual select function
+  #manually_select <- function(n_points, mess) {
+  #  message(mess)
+  #  x <- gglocator(n_points)
+  #  colnames(x) <- c("x_coord", "y_coord")
+  #  return(x)
+  #}
+
+  ## check if automatic identification worked
+  # plot max footprint with additional points
+  #g <- plot_footprint(pressure_frames, plot_COP = TRUE, plot_outline = TRUE)
+  #g <- g + geom_point(data = heel_coord, aes (x = x_coord, y = y_coord), shape = 6)
+  #g <- g + geom_point(data = toe_coord, aes (x = x_coord, y = y_coord), shape = 6)
+  #g <- g + geom_point(data = start_point, aes (x = x_coord, y = y_coord), shape = 2)
+  #g <- g + geom_point(data = end_point, aes (x = x_coord, y = y_coord), shape = 2)
+  #g <- g + geom_line(data = m_bor, aes(x = x_coord, y = y_coord), colour = "purple")
+  #g <- g + geom_line(data = l_bor, aes(x = x_coord, y = y_coord), colour = "orange")
+  #print(g)
+  #auto_worked <- readline("Have points been correctly identified? c: manually select cop; a: manually select all")
+
+  ## if automatic identification failed, redo manually
+  #if (auto_worked == "a") {
+  #  # plot footprint
+  #  g <- plot_footprint(pressure_frames, plot_COP = TRUE, plot_outline = TRUE)
+
+    # select points
+  #  m_bor <- manually_select(2, "select medial border: proximal point first, then distal")
+  #  l_bor <- manually_select(2, "select lateral border: proximal point first, then distal")
+  #  heel_coord <- manually_select(1, "select most proximal point of heel")
+  #  toe_coord <- manually_select(1, "select most distal point of toes")
+  #  cop_start <- manually_select(1, "select the most medial point near the start of the COP")
+  #  cop_end <- manually_select(1, "select the most medial point near the end of the COP")
+  #}
+
+  #if (auto_worked == "c") {
+  #  # plot footprint
+  #  g <- plot_footprint(pressure_frames, plot_COP = TRUE, plot_outline = TRUE)
+
+    # select points
+  #  start_point <- manually_select(1, "select the most medial point near the start of the COP")
+  #  end_point <- manually_select(1, "select the most medial point near the end of the COP")
+  #}
+
+  # return CPEI
+  return(CPEI)
+}
+
+
+# =============================================================================
+
+#' @title Dynamic Plantar Loading Index
+#' @description Determine Dynamic plantar loading index (DPLI) for
+#' footprint pressure data
+#' @param pressure_data List. First item is a 3D array covering each timepoint
+#' of the measurement.
+#' @param n_bins Numeric. Number of bins used to calculate DPLI
+#' @returns Data frame. Contains DPLI for each step
+#' @examples
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' dpli(pressure_data, 10)
+#' @importFrom graphics hist
+#' @importFrom stats dnorm lm sd
+#' @export
+
+dpli <- function(pressure_data, n_bins) {
+  if (length(pressure_data[[6]]) == 0) {
+    n_step = 1
+  } else {
+    n_step = nrow(pressure_data[[6]])
+  }
+
+  # df to store result
+  dpli <- data.frame(step = c(1:n_step),
+                     dpli = rep(NA, length.out = n_step))
+
+  # get loading index for each step
+  for (step in 1:n_step) {
+    # get step data
+    if (n_step == 1) {
+      pressure_array <- pressure_data[[1]]
+    } else {
+      step_str <- unname(unlist(pressure_data[[6]][step, 2]))
+      step_end <- unname(unlist(pressure_data[[6]][step, 3]))
+      pressure_array <- pressure_data[[1]][, , c(step_str:step_end)]
+    }
+
+    # check for step side (pedar)
+    if (pressure_data[[2]] == "pedar") {
+      if (pressure_data[[6]][step, 1] == "RIGHT") {
+        pressure_array[2, , ] <- 0
+      } else {pressure_array[1, , ] <- 0}
+    }
+
+    # get peak pressure vector
+    press_vec <- rep(NA, length.out = dim(pressure_array)[3])
+    for (i in 1:dim(pressure_array)[3]) {
+      press_vec[i] <- max(pressure_array[, , i])
+    }
+
+    # interpolate to 101
+    press_vec <- approxP(press_vec, 101)
+
+    # bin data
+    binned <- hist(press_vec, breaks = seq(from = min(press_vec),
+                                           to = max(press_vec),
+                                           length.out = n_bins + 1),
+                   plot = FALSE)
+
+    # get distribution
+    sd_press <- sd(press_vec)
+    mean_press <- mean(press_vec)
+    norm_dist <- dnorm(binned$mids, mean_press, sd_press)
+    norm_dist <- norm_dist * (max(binned$counts) / max(norm_dist))
+
+
+    # get r^2
+    dpli[step, 2] <- summary(lm(binned$counts ~ norm_dist))$adj.r.squared
+  }
+
+  # return
+  return(dpli)
+}
+
+# =============================================================================
+
+#' Analyze masked regions of pressure data
+#' @param pressure_data List. Includes a 3D array covering each timepoint of the
+#'   measurement. z dimension represents time
+#' @param partial_sensors Logical Defines how sensors that do not
+#'   lie wholly within mask are dealt with. If FALSE, they will be excluded;
+#'   if TRUE, for relevant variables their contribution will be weighted by the
+#'   proportion of the sensor that falls within the mask border
+#' @param variable String. Variable to be determined. "press_peak_sensor",
+#' "press_peak_mask", "contact_area_peak", "pti_1", "pti_2",
+#' "force_time_integral", "force_peak"
+#' @param pressure_units String. Default "kPa". Other options: "MPa", "Ncm2"
+#' (Newtons per square centimeter)
+#' @param area_units String. Default is "cm2" (square centimeters). Other
+#' options "m2" (square meters); "mm2" (square millimeters)
+#' @return Data frame. Contains values for each mask plus additional information
+#' relevant to the data including cycle/step and foot side
+#' @examples
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' pressure_data <- automask(pressure_data)
+#' mask_analysis(pressure_data, FALSE, variable = "press_peak_sensor")
+#' @importFrom sf st_intersects st_geometry st_area
+#' @importFrom pracma trapz
+#' @export
+
+mask_analysis <- function(pressure_data, partial_sensors = FALSE,
+                          variable = "press_peak_sensor",
+                          pressure_units = "kPa", area_units = "cm2") {
+  # set global variables
+  pedar_insole_type <- sens_poly <- act_sens <- area <- max_df <-
+    mask_sides <- overlap_list <- time <- side <- cycle <- NULL
+
+  # masks
+  masks <- pressure_data[[5]]
+
+  # events
+  events <- pressure_data[[6]]
+
+  # set up mask/sensor areas
+  ## sensor area
+  if (pressure_data[[2]] != "pedar") {
+    sensor_area <- pressure_data[[3]][1] * pressure_data[[3]][2]
+
+    # active sensors
+    act_sens <- which(footprint(pressure_data, "max") > 0)
+
+    ## Make active sensors into polygons
+    sens_poly <- sensor_2_polygon(pressure_data)
+
+    ## For each region mask, find which polygons intersect
+    sens_mask_df <- matrix(rep(0, length.out = (length(sens_poly) * length(masks))),
+                           nrow = length(sens_poly), ncol = length(masks))
+    sens_mask_df <- as.data.frame(sens_mask_df)
+    colnames(sens_mask_df) <- names(masks)
+    for (i in 1:length(masks)){
+      for (j in 1:length(sens_poly)) {
+        x <- st_intersects(masks[[i]], sens_poly[[j]])
+        if (identical(x[[1]], integer(0)) == FALSE) {
+          y <- st_intersection(masks[[i]], sens_poly[[j]])
+          sens_mask_df[j, i] <- st_area(y) / sensor_area
+        }
+      }
+    }
+  }
+
+  if (pressure_data[[2]] == "pedar") {
+    # get mask sides
+    mask_sides <- rep(NA, length.out = length(masks))
+    for (mask in seq_along(masks)) {
+      mask_coords <- st_coordinates(masks[[mask]])
+      if (mean(mask_coords[, 1]) < 0.5) {
+        mask_sides[mask] <- "LEFT"
+      } else {
+        mask_sides[mask] <- "RIGHT"
+      }
+    }
+
+    # Make active sensors into polygons
+    sens_poly <- sensor_2_polygon(pressure_data)
+
+    # For each region mask, find which polygons intersect
+    sens_mask_df <- matrix(rep(0, length.out = (length(sens_poly) * length(masks))),
+                           nrow = length(sens_poly), ncol = length(masks))
+    sens_mask_df <- as.data.frame(sens_mask_df)
+    colnames(sens_mask_df) <- names(masks)
+    for (mask in seq_along(masks)){
+      for (j in 1:length(sens_poly)) {
+        x <- st_intersects(masks[[mask]], sens_poly[[j]])
+        if (identical(x[[1]], integer(0)) == FALSE) {
+          y <- st_intersection(masks[[mask]], sens_poly[[j]])
+          sens_mask_df[j, mask] <- st_area(y) / st_area(sens_poly[[j]])
+        }
+      }
+    }
+  }
+
+  # create blank output dataframes
+  output_df <- data.frame(time = double(), cycle = integer(), side = factor(),
+                          pressure_variable = factor(), mask_name = factor(),
+                          value = double())
+
+  # Analyse regions for maximum value of any sensor within region during trial
+  if (variable == "press_peak_sensor") {
+    output_df <- pressure_peak(pressure_data, sens_mask_df, mask_sides,
+                               output_df, pressure_units)
+  }
+
+  # Analyse regions for maximum value of any sensor for each measurement frame
+  if (variable == "press_peak_sensor_ts") {
+    for (mask in seq_along(masks)) {
+      for (i in 1:(dim(pressure_data[[1]])[3])) {
+        P <- c(pressure_data[[1]][, , i])
+        P <- P[act_sens]
+        output_mat[i, mask] <- max(P[which(sens_mask_df[, mask] > 0)])
+      }
+    }
+    if (pressure_units == "MPa") {output_mat <- output_mat * 0.001}
+    if (pressure_units == "Ncm2") {output_mat <- output_mat * 0.1}
+  }
+
+  # Analyse regions for peak regional pressure (defined as the pressure
+  # averaged over the mask)
+  if (variable == "press_peak_mask") {
+    output_df <- pressure_mean(pressure_data, sens_mask_df, mask_sides,
+                               output_df, pressure_units)
+  }
+
+  # Analyse regions for peak mask pressure (defined as the maximum mean pressure
+  # of active sensors in region during the trial). Outputs 101 point vector (kPa)
+  if (variable == "press_peak_mask_ts") {
+    for (mask in seq_along(masks)) {
+      for (i in 1:(dim(pressure_data[[1]])[3])) {
+        P <- c(pressure_data[[1]][, , i])
+        P <- P[act_sens] * sensor_area * 1000
+        CA <- rep(sensor_area, length.out = length(P))
+        force <- sum(P * sens_mask_df[, mask])
+        contact_area <- sum(CA * sens_mask_df[, mask])
+        output_mat[i, mask] <- force / contact_area / 1000
+      }
+    }
+    if (pressure_units == "MPa") {output_mat <- output_mat * 0.001}
+    if (pressure_units == "Ncm2") {output_mat <- output_mat * 0.1}
+  }
+
+  # Analyse regions for maximum contact area of region during trial
+  if (variable == "contact_area_peak") {
+    output_df <- contact_area(pressure_data, sens_mask_df, mask_sides,
+                              output_df, area_units)
+  }
+
+  # Analyse regions for contact area throughout the trial (outputs vector)
+  if (variable == "contact_area_ts") {
+    for (mask in seq_along(masks)) {
+      for (i in 1:(dim(pressure_data[[1]])[3])) {
+        P <- c(pressure_data[[1]][, , i])
+        P <- P[act_sens]
+        P[P > 0] <- sensor_area
+        cArea <- sum(P * sens_mask_df[, mask])
+        if (area_units == "cm2") {cArea <- cArea * 10000}
+        if (area_units == "mm2") {cArea <- cArea * 1000000}
+        output_mat[i, mask] <- cArea
+      }
+    }
+  }
+
+  # Analyse regions for pressure time integral (Novel definition)
+  if (variable == "pti_1") {
+    output_df <- pti_1(pressure_data, sens_mask_df, mask_sides,
+                       output_df, pressure_units)
+  }
+
+  # Analyse regions for pressure time integral (Melai definition)
+  if (variable == "pti_2") {
+    output_df <- pti_2(pressure_data, sens_mask_df, mask_sides,
+                       output_df, pressure_units)
+  }
+
+  # Analyse regions for force time integral
+  if (variable == "fti") {
+    output_df <- fti(pressure_data, sens_mask_df, mask_sides,
+                     output_df)
+  }
+
+  # Analyse regions for maximum force during the trial
+  if (variable == "force_peak") {
+    output_df <- force_peak(pressure_data, sens_mask_df, mask_sides,
+                            output_df)
+  }
+
+  # Analyse regions for force throughout the trial (outputs vector)
+  if (variable == "force_ts") {
+    for (mask in seq_along(masks)) {
+      for (i in 1:(dim(pressure_data[[1]])[3])) {
+        P <- c(pressure_data[[1]][, , i])
+        P <- P[act_sens] * sensor_area * 1000
+        output_mat[i, mask] <- sum(P * sens_mask_df[, mask])
+      }
+    }
+  }
+
+  # adjust df
+  if (!str_ends(variable, "_ts")) {output_df <- subset(output_df, select = -c(time))}
+  if (pressure_data[[2]] != "pedar") {output_df <- subset(output_df, select = -c(side))}
+  if (length(events) == 0) {output_df <- subset(output_df, select = -c(cycle))}
+
+  # return
+  return(output_df)
+}
+
+
+# =============================================================================
+# =============================================================================
+
+# helper functions
+
+#' @title Get outline of pressure region
+#' Determine outline (convex hull) of pressure measurement
+#' @param pressure_data List. Includes a 3D array covering each timepoint of the
+#'   measurement. z dimension represents time
+#' @param pressure_image String. "max" = footprint of maximum sensors. "frame"
+#' = an individual frame
+#' @param frame Integer. Frame number to use
+#' @return Polygon. sfg object representing convex hull outline
+#' @examples
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' pressure_outline(pressure_data)
+#' pressure_outline(pressure_data, frame = 50)
+#' @importFrom magrittr "%>%"
+#' @importFrom sf st_as_sf st_convex_hull st_combine st_buffer
+#' @noRd
+
+pressure_outline <- function(pressure_data, pressure_image = "max", frame) {
+  # check inputs
+  if (is.array(pressure_data[[1]]) == FALSE)
+    stop("pressure data must contain array")
+
+  # check that this is not pedar data
+  if (pressure_data[[2]] == "pedar")
+    stop("data cannot be from pedar")
+
+  # determine active sensor coordinates
+  if (pressure_image == "max") {
+    coords <- sensor_coords(pressure_data, pressure_image = "max")
+  } else {
+    coords <- sensor_coords(pressure_data, "frame", frame)
+  }
+
+  # calculate convex hull
+  sens_coords_df <- coords %>%
+    st_as_sf(coords = c("x_coord", "y_coord"))
+  fp_chull <- st_convex_hull(st_combine(sens_coords_df))
+
+  # add buffer here
+  buffer_size <- pressure_data[[3]][1] / 2
+  fp_chull_buffer <- st_buffer(fp_chull, buffer_size)
+
+  # return convex hull coordinates
+  return(fp_chull_buffer)
+}
+
+
+#' interpolation function
+#' @importFrom stats approx
+#' @noRd
+
+approxP <- function(x, interp_to) {
+  y <- approx(x, n = interp_to)
+  y$x <- NULL
+  y <- unname(unlist(y))
+  return(y)
+}
+
+
+#' @title Get minimum bounding box (angle)
+#' @description Create a bounding box around sensor coordinate array. Adapted
+#' from function in shotGroups package
+#' @param xy Matrix. n row by 2 column with x-y coords of points to be
+#' bounded
+#' @return List
+#' @importFrom grDevices chull
+#' @noRd
+
+getMinBBox <- function(xy) {
+  stopifnot(is.matrix(xy), is.numeric(xy), nrow(xy) >= 2, ncol(xy) == 2)
+
+  ## rotating calipers algorithm using the convex hull
+  H    <- chull(xy)           # hull indices, vertices ordered clockwise
+  n    <- length(H)           # number of hull vertices
+  hull <- xy[H, ]             # hull vertices
+
+  ## unit basis vectors for all subspaces spanned by the hull edges
+  hDir  <- diff(rbind(hull, hull[1,])) # account for circular hull vertices
+  hLens <- sqrt(rowSums(hDir^2))       # length of basis vectors
+  huDir <- diag(1/hLens) %*% hDir      # scaled to unit length
+
+  ## unit basis vectors for the orthogonal subspaces
+  ## rotation by 90 deg -> y' = x, x' = -y
+  ouDir <- cbind(-huDir[ , 2], huDir[ , 1])
+
+  ## project hull vertices on the subspaces spanned by the hull edges, and on
+  ## the subspaces spanned by their orthogonal complements - in subspace coords
+  projMat <- rbind(huDir, ouDir) %*% t(hull)
+
+  ## range of projections and corresponding width/height of bounding rectangle
+  rangeH  <- matrix(numeric(n * 2), ncol = 2)   # hull edge
+  rangeO  <- matrix(numeric(n * 2), ncol = 2)   # orth subspace
+  widths  <- numeric(n)
+  heights <- numeric(n)
+  for(i in seq(along = H)) {
+    rangeH[i, ] <- range(projMat[  i, ])
+    rangeO[i, ] <- range(projMat[n + i, ])  # orth subspace is in 2nd half
+    widths[i]   <- abs(diff(rangeH[i, ]))
+    heights[i]  <- abs(diff(rangeO[i, ]))
+  }
+
+  ## extreme projections for min-area rect in subspace coordinates
+  eMin  <- which.min(widths * heights)   # hull edge leading to minimum-area
+  hProj <- rbind(   rangeH[eMin, ], 0)
+  oProj <- rbind(0, rangeO[eMin, ])
+
+  ## move projections to rectangle corners
+  hPts <- sweep(hProj, 1, oProj[ , 1], "+")
+  oPts <- sweep(hProj, 1, oProj[ , 2], "+")
+
+  ## corners in standard coordinates, rows = x,y, columns = corners
+  ## in combined (4x2)-matrix: reverse point order to be usable in polygon()
+  basis <- cbind(huDir[eMin, ], ouDir[eMin, ])  # basis formed by hull edge and orth
+  hCorn <- basis %*% hPts
+  oCorn <- basis %*% oPts
+  pts   <- t(cbind(hCorn, oCorn[ , c(2, 1)]))
+
+  # Which sides of BBox are longest?
+  if (dist(pts[c(1, 2), ]) > dist(pts[c(2, 3), ])) {
+    side1 <- pts[c(1, 2), ]
+    side2 <- pts[c(3, 4), ]
+  } else {
+    side1 <- pts[c(2, 3), ]
+    side2 <- pts[c(4, 1), ]
+  }
+
+  # order so lowest first
+  side1 <- side1[order(side1[, 2]), ]
+  side2 <- side2[order(side2[, 2]), ]
+
+  # which side is L/R
+  if (side1[1, 1] > side2[1, 1]) {
+    side1_ <- side1 # side1_ is right
+    side2_ <- side2
+  } else {
+    side1_ <- side2
+    side2_ <- side1
+  }
+
+  mat <- rbind(side1_, side2_)
+
+  #return(list(pts=pts, width=widths[eMin], height=heights[eMin]))
+  return(mat)
+}
+
+
+#' @title masks (sf format) to dataframe
+#' @description converts mask coordinates into a data frame
+#' @param masks List
+#' @returns Data frame
+#' @importFrom dplyr bind_rows
+#' @noRd
+
+masks_2_df <- function(masks) {
+  # no. of masks
+  n_masks <- length(masks)
+
+  # empty df
+  df <- data.frame(mask = factor(),
+                   x = double(),
+                   y = double())
+
+  # get coordinates of each mask and store in df
+  for (mask in seq_along(masks)) {
+    coords <- st_coordinates(masks[[mask]])[, c(1:2)]
+    mask_name <- rep(names(masks)[mask], length.out = nrow(coords))
+    df_ <- data.frame(mask = mask_name, x = coords[, 1], y = coords[, 2])
+    df <- bind_rows(df, df_)
+  }
+
+  # return
+  return(df)
+}
+
+
+#' @title Get coordinates of active sensors
+#' @description Produces a data frame with coordinates of sensors
+#' @param pressure_data List. Includes a 3D array covering each timepoint of the
+#'   measurement. z dimension represents time
+#' @param pressure_image. String. Which pressure image to use. Options are
+#' "all_active", "all", or "frame".
+#' @param frame Numeric. If pressure image is frame, the numeric value should be
+#' provided here
+#' @return Data frame. x and y coordinates of sensors
+#' @examples
+#' coords <- sensor_coords(pressure_data)
+#' @noRd
+
+sensor_coords <- function(pressure_data, pressure_image = "all_active", frame) {
+  # pressure image
+  if (pressure_image == "all_active" | pressure_image == "max" |
+      pressure_image == "mean") {
+    sens <- footprint(pressure_data, variable = "max")
+  }
+  if (pressure_image == "all") {
+    dims <- dim(pressure_data[[1]])
+    sens <- matrix(rep(10, length.out = dims[1] * dims[2]), nrow = dims[1],
+                   ncol = dims[2])
+  }
+  if (pressure_image == "frame") {
+    sens <- footprint(pressure_data, variable = "frame", frame = frame)
+  }
+
+  # dimensions
+  sens_x <- pressure_data[[3]][1]
+  sens_y <- pressure_data[[3]][2]
+
+  # data frame with active sensors as coordinates
+  x_cor <- seq(from = sens_x / 2, by = sens_x, length.out = ncol(sens))
+  x_cor <- rep(x_cor, each = nrow(sens))
+  y_cor <- seq(from = (sens_y / 2) + ((nrow(sens) - 1) * sens_y),
+               by = (-1 * sens_y), length.out = nrow(sens))
+  y_cor <- rep(y_cor, times = ncol(sens))
+  coords <- data.frame(x_coord = x_cor, y_coord = y_cor)
+
+  # remove inactive sensors
+  P <- as.vector(sens)
+  if (pressure_image != "all") {
+    coords <- coords[which(P > 0), ]
+  }
+
+  # return sensor coordinates
+  return(coords)
+}
+
+
+
+#' @title sensor array to polygon
+#' @description converts sensor positions (coordinates) to polygons
+#' @param pressure_data List
+#' @param pressure_image String
+#' @param frame Numeric
+#' @param output String. "df" dataframe for plotting or "sf" shape poly for analysis
+#' @importFrom sf st_polygon st_coordinates
+#' @noRd
+
+sensor_2_polygon <- function(pressure_data, pressure_image = "all_active",
+                             frame = NA, output = "sf") {
+  # set global variables
+  pedar_insole_grid <- NULL
+
+  # sensor coordinates
+  sens_polygons <- list()
+  if (pressure_data[[2]] != "pedar") {
+    sens_coords <- sensor_coords(pressure_data, pressure_image, frame)
+
+    # sensor dimensions
+    width <- pressure_data[[3]][1] / 2
+    height <- pressure_data[[3]][2] / 2
+
+    # get corner points and make into polygon
+    for (sens in 1:nrow(sens_coords)) {
+      x1 <- sens_coords[sens, 1] - width
+      y1 <- sens_coords[sens, 2] + height
+      x2 <- sens_coords[sens, 1] + width
+      y2 <- sens_coords[sens, 2] + height
+      x3 <- sens_coords[sens, 1] + width
+      y3 <- sens_coords[sens, 2] - height
+      x4 <- sens_coords[sens, 1] - width
+      y4 <- sens_coords[sens, 2] - height
+      if (y1 < 0) {y1 <- 0}
+      if (y2 < 0) {y2 <- 0}
+      if (y3 < 0) {y3 <- 0}
+      if (y4 < 0) {y4 <- 0}
+      sens_polygons[[sens]] <- st_polygon(list(matrix(c(x1, x2, x3, x4, x1,
+                                                        y1, y2, y3, y4, y1),
+                                                      5, 2)))
+    }
+  } else {
+    pedar_insole_grid <- pedar_insole_grids()
+    rs <- c(1:99, 101:199)
+    for (sens in 1:length(rs)) {
+      x1 <- pedar_insole_grid[rs[sens], 1]
+      y1 <- pedar_insole_grid[rs[sens], 2]
+      x2 <- pedar_insole_grid[rs[sens], 3]
+      y2 <- pedar_insole_grid[rs[sens], 4]
+      x3 <- pedar_insole_grid[rs[sens], 5]
+      y3 <- pedar_insole_grid[rs[sens], 6]
+      x4 <- pedar_insole_grid[rs[sens], 7]
+      y4 <- pedar_insole_grid[rs[sens], 8]
+      sens_polygons[[sens]] <- st_polygon(list(matrix(c(x1, x2, x3, x4, x1,
+                                                        y1, y2, y3, y4, y1),
+                                                      5, 2)))
+    }
+  }
+
+  # make df if required
+  if (output == "df") {
+    id_df <- data.frame(x = double(),
+                        y = double(),
+                        z = integer())
+    # make into identity df
+    for (i in 1:length(sens_polygons)) {
+      mat <- st_coordinates(sens_polygons[[i]])[, c(1, 2)]
+      mat_df <- data.frame(mat)
+      id <- rep(i, length.out = nrow(mat_df))
+      mat_df <- cbind(mat_df, id)
+      colnames(mat_df) <- c("x", "y", "id")
+      id_df <- rbind(id_df, mat_df)
+    }
+  }
+
+  # check for minus values
+
+  # return
+  if (output == "sf") {return(sens_polygons)}
+  if (output == "df") {return(id_df)}
+}
+
+#' @title pedar force
+#' @description generates force curve from pedar data
+#' @param pressure_data List.
+#' @param variable "force", "area"
+#' @param threshold Numeric. Threshold value for sensor to be considered active.
+#' Currently only applies to insole data
+#' @param threshold Numeric. For area calculations, minimum threshold for sensor to
+#' be active
+#' @return Vector
+#' @noRd
+
+force_pedar <- function(pressure_data, variable = "force", threshold = 10) {
+  # set global variables
+  pedar_insole_areas <- NULL
+
+  # check this is pedar data
+  if (pressure_data[[2]] != "pedar")
+    stop("must be pedar data")
+
+  # get insole sizing
+  pedar_insole_type <- tolower(pressure_data[[3]])
+
+  # get pedar sensor areas
+  pedar_insole_areas <- pedar_insole_area()
+  pedarSensorAreas <- as.vector(pedar_insole_areas[[pedar_insole_type]] *
+                                  0.001)
+
+  # change array direction
+  force_array <- aperm(pressure_data[[1]], c(3, 2, 1))
+
+  # output
+  output_df = data.frame()
+
+  # calculate force
+  if (variable == "force") {
+    force_right <- rowSums(force_array[, , 1] * pedarSensorAreas)
+    force_left <- rowSums(force_array[, , 2] * pedarSensorAreas)
+    output_df <- cbind(force_right, force_left)
+  }
+
+  # calculate area
+  if (variable == "area") {
+    area_right <- force_array[, , 1] > threshold
+    area_right <- rowSums(area_right * pedarSensorAreas)
+    area_left <- force_array[, , 2] > threshold
+    area_left <- rowSums(area_left * pedarSensorAreas)
+    output_df <- cbind(area_right, area_left)
+  }
+
+  # return
+  return(output_df)
+}
+
+
+#' @title plot pedar
+#' @description produces dataframe that plot_pressure uses to plot pedar data
+#' @param pressure_data List.
+#' @param pressure_image String. "max" = maximum values for full trial;
+#' "mean" = mean value across trial; "step_max"; "step_mean"
+#' @param foot_side String. "both", "left", or "right"
+#' @param step_n Numeric. If pressure_image is "step_max", the step number to
+#' analyze
+#' @return df
+#' @noRd
+
+plot_pedar <- function(pressure_data, pressure_image = "max",
+                       foot_side = "left", step_n) {
+  # set global variables
+  pedar_insole_grid <- x <- y <- id <- NULL
+
+  # check this is pedar (or other suitable) data
+  if (!(pressure_data[[2]] == "pedar"))
+    stop("data should be from pedar")
+
+  # get L+ R data frames
+  dims <- dim(pressure_data[[1]])
+  pressure_R_mat <- matrix(pressure_data[[1]][1, , ],
+                           dims[2], dims[3])
+  pressure_L_mat <- matrix(as.vector(pressure_data[[1]][2, , ]),
+                           dims[2], dims[3])
+
+  # pressure image
+  if (pressure_image == "max") {
+    R_data <- apply(pressure_R_mat, 1, max)
+    L_data <- apply(pressure_L_mat, 1, max)
+  }
+
+  # separate into steps
+  if (pressure_image == "step_max") {
+    events <- pressure_data[[6]]
+    pressure_R_mat <- pressure_R_mat[, c(events[step_n, 2]:events[step_n, 3])]
+    pressure_L_mat <- pressure_L_mat[, c(events[step_n, 2]:events[step_n, 3])]
+    R_data <- apply(pressure_R_mat, 1, max)
+    L_data <- apply(pressure_L_mat, 1, max)
+  }
+
+  # combine data
+  comb_data <- c(L_data, R_data)
+
+  # make ids
+  ids <- c()
+  for (i in 1:99) {ids = append(ids, paste0("L", i))}
+  for (i in 1:99) {ids = append(ids, paste0("R", i))}
+
+  # make df
+  df <- data.frame(id = ids, value = comb_data)
+
+  # add coordinates to df
+  pedar_insole_grid <- pedar_insole_grids()
+  xs <- c()
+  for (i in c(101:199, 1:99)) {
+    for (j in c(1, 3, 5, 7)) {xs = append(xs, pedar_insole_grid[i, j])}
+  }
+  ys <- c()
+  for (i in c(101:199, 1:99)) {
+    for (j in c(2, 4, 6, 8)) {ys = append(ys, pedar_insole_grid[i, j])}
+  }
+  position <- data.frame(id = rep(ids, each = 4), x = xs, y = ys)
+  df <- merge(df, position, by = c("id"))
+
+  # add color
+  df <- generate_colors(df)
+
+  # side
+  if (foot_side == "left") {
+    df <- df[397:792,]
+  }
+  if (foot_side == "right") {
+    df <- df[1:396,]
+  }
+
+  # return
+  return(df)
+}
+
+
+#' @title Generate colors
+#' @description Let's the user prescribe the color scale for plots
+#' @param df Dataframe.
+#' @param col_type String. "default": novel color scheme; "custom": user
+#' supplied
+#' @param break_values Vector. Vector with break values to be used. Should be one
+#' shorter than break_values
+#' @param break_colors Vector. Vector with colors to be used. Should be one
+#' longer than break_values
+#' @return Data frame.
+#' @noRd
+
+generate_colors <- function(df, col_type = "default", break_values,
+                            break_colors) {
+  if (col_type == "default") {
+    break_values <- c(0, 40, 60, 100, 150, 220, 300, 1000000)
+    break_colors <- c("grey","lightblue", "darkblue","green","yellow",
+                      "red","pink")
+  } else {
+    # check break_values and break_colors
+    if (break_values[1] <= 0)
+      stop("first break value should be >0")
+    if(length(break_values) != (length(break_colors) - 1))
+      stop("break_values should be one shorter than break_colors")
+    if ("white" %in% break_colors)
+      stop("break_colors cannot contain white")
+
+    # add high final value to break_values
+    break_values <- c(-1, 0, break_values, 1000000)
+    break_colors <- c("white", break_colors)
+  }
+
+  # add col column
+  df$cols <- cut(df$value, breaks = break_values,
+                 labels = break_colors)
+
+  #return
+  return (df)
+}
+
+#' @title extend st line
+#' @param line sf linestring
+#' @param distance Numeric.
+#' @param end String
+#' @importFrom sf st_sfc st_crs st_coordinates
+#' @noRd
+
+st_extend_line <- function(line, distance, end = "BOTH") {
+  if (!(end %in% c("BOTH", "HEAD", "TAIL")) | length(end) != 1)
+    stop("'end' must be 'BOTH', 'HEAD' or 'TAIL'")
+
+  M <- st_coordinates(line)[,1:2]
+  keep <- !(end == c("TAIL", "HEAD"))
+
+  ends <- c(1, nrow(M))[keep]
+  i <- c(2, nrow(M) - 1)
+  j <- c(1, -1)
+  headings <- mapply(i, j, FUN = function(i, j) {
+    Ax <- M[i-j,1]
+    Ay <- M[i-j,2]
+    Bx <- M[i,1]
+    By <- M[i,2]
+    unname(atan2(Ay-By, Ax-Bx))
+  })
+  #headings <- st_ends_heading(line)[keep]
+  distances <- if (length(distance) == 1) rep(distance, 2) else rev(distance[1:2])
+
+  M[ends,] <- M[ends,] + distances[keep] * c(cos(headings), sin(headings))
+  newline <- st_linestring(M)
+
+  # If input is sfc_LINESTRING and not sfg_LINESTRING
+  if (is.list(line)) newline <- st_sfc(newline, crs = st_crs(line))
+
+  return(newline)
+}
+
+#' @title line to polygon
+#' @description Extrude line to form polygon
+#' @param mat Matrix. xy points describing line or polyline
+#' @param distance Numeric. Distance to extrude line
+#' @param direction String. "+X" "-X", "+y", or "-Y"
+#' @return Polygon. sf polygon object
+#' @importFrom sf st_polygon
+#' @noRd
+
+st_line2polygon <- function(mat, distance, direction) {
+  # get ends
+  if (mat[1, 1] >= mat[nrow(mat), 1]) {dir1 <- "RL"} else {dir1 <- "LR"}
+  if (mat[1, 2] >= mat[nrow(mat), 2]) {dir2 <- "TB"} else {dir2 <- "BT"}
+
+  # +Y
+  if (direction == "+Y" ) {
+    mat_pts <- rbind(mat, c(mat[nrow(mat), 1], mat[nrow(mat), 2] + distance),
+                     c(mat[1, 1], mat[1, 2] + distance), mat[1, ])
+    if (dir1 == "RL") {mat <- mat[nrow(mat):1, ]}
+  }
+  # -Y
+  if (direction == "-Y") {
+    mat_pts <- rbind(mat, c(mat[nrow(mat), 1], mat[nrow(mat), 2] - distance),
+                     c(mat[1, 1], mat[1, 2] - distance), mat[1, ])
+    if (dir1 == "LR") {mat <- mat[nrow(mat):1, ]}
+  }
+  # +X
+  if (direction == "+X") {
+    mat_pts <- rbind(mat, c(mat[nrow(mat), 1] + distance, mat[nrow(mat), 2]),
+                     c(mat[1, 1] + distance, mat[1, 2]), mat[1, ])
+    if (dir2 == "TB") {mat <- mat[nrow(mat):1, ]}
+  }
+
+  # -X
+  if (direction == "-X") {
+    mat_pts <- rbind(mat, c(mat[nrow(mat), 1] - distance, mat[nrow(mat), 2]),
+                     c(mat[1, 1] - distance, mat[1, 2]), mat[1, ])
+    if (dir2 == "BT") {mat <- mat[nrow(mat):1, ]}
+  }
+
+  # make polygon
+  mat_poly <- st_polygon(list(mat_pts))
+}
+
+
+#' @title Get toe line
+#' @description Calculates line proximal to toes
+#' @param pressure_data List. First item should be a 3D array covering each
+#' timepoint of the measurement. z dimension represents time
+#' @importFrom zoo as.zoo rollapply
+#' @importFrom stats na.omit
+#' @importFrom sf st_cast st_join st_sf
+#' @noRd
+
+toe_line <- function(pressure_data) {
+  # global variables
+  clusterID <- NULL
+
+  # get max footprint and take top half
+  pf_max <- footprint(pressure_data)
+  pf_max_top <- pf_max[1:(round(nrow(pf_max)) / 2), ]
+  pressure_data2 <- pressure_data
+  pressure_data2[[1]] <- pf_max_top
+  act_sens_vec <- which(pf_max_top > 0)
+
+  # remove small islands (toes)
+  ## make polygon df
+  polygons <- sensor_2_polygon(pressure_data2, output = "sf")
+  pg_df <- data.frame(sens_id = 1:length(polygons))
+  pg_df$geometry <- st_sfc(polygons)
+  pg_df <- st_as_sf(pg_df)
+
+  ## find islands
+  geometries <- st_cast(st_union(st_buffer(pg_df, 0.0001)), "POLYGON")
+  dissolved <- st_sf(geometries)
+  dissolved$clusterID = 1:length(geometries)
+  pg_df <- st_join(pg_df, dissolved)
+
+  ## remove small islands
+  pg_df <- pg_df %>% filter(clusterID == which.max(table(pg_df$clusterID)))
+  sens_keep <- pg_df[["sens_id"]]
+  sens_keep <- act_sens_vec[sens_keep]
+  pf_max_top_vec <- c(pf_max_top)
+  zeros <- c(1:length(pf_max_top_vec))
+  zeros <- zeros[!zeros %in% sens_keep]
+  pf_max_top_vec[zeros] <- 0
+  pf_max_top2 <- matrix(pf_max_top_vec, nrow = nrow(pf_max_top), ncol = ncol(pf_max_top))
+
+  # which cols had toes removed
+  good_cols <- rep(NA, length.out = ncol(pf_max))
+  for (i in 1:ncol(pf_max)) {
+    og <- which.max(pf_max_top[, i] > 0)
+    og_rm <- which.max(pf_max_top2[, i] > 0)
+    if (og != og_rm) {good_cols[i] <- og_rm - 2}
+  }
+
+  # remove negative values
+  good_cols[good_cols < 1] <- NA
+
+  # which of the remaining cols have minima between two maxima
+  remaining_cols <- which(is.na(good_cols))
+  for (i in seq_along(remaining_cols)) {
+    mins <- which(rollapply(as.zoo(pf_max_top[, remaining_cols[i]]), 3,
+                            function(x) which.min(x) == 2) == TRUE)
+    mins_rev <- which(rollapply(as.zoo(rev(pf_max_top[, remaining_cols[i]])), 3,
+                                function(x) which.min(x) == 2) == TRUE)
+    maxs <- which(rollapply(as.zoo(pf_max_top[, remaining_cols[i]]), 3,
+                            function(x) which.max(x) == 2) == TRUE)
+    if (length(maxs) >= 2) {
+      if (mins[1] > maxs[1] & mins[1] < maxs[2]) {
+        reps <- rle(pf_max_top[(mins[1] + 1):ncol(pf_max_top), remaining_cols[i]])$lengths[1]
+        if (reps > 1) {
+          good_cols[i] <- mins[1] + (reps / 2)
+        } else {good_cols[remaining_cols[i]] <- mins[1]}
+      }
+    }
+  }
+
+  # check points are less than 1/3 from front of foot but > 15%
+  ff_dist <- round(nrow(pf_max) / 6)
+  ff_prox <- round(nrow(pf_max) / 12)
+  remaining_cols2 <- which(!is.na(good_cols))
+  for (fp_col in seq_along(remaining_cols2)) {
+    if ((good_cols[remaining_cols2[fp_col]] - (which(pf_max_top[, remaining_cols2[fp_col]] > 0)[1])) >= ff_dist) {
+      good_cols[remaining_cols2[fp_col]] <- NA
+    }
+  }
+  remaining_cols3 <- which(!is.na(good_cols))
+  for (fp_col in seq_along(remaining_cols3)) {
+    if ((good_cols[remaining_cols3[fp_col]] - (which(pf_max_top[, remaining_cols3[fp_col]] > 0)[1])) < ff_prox) {
+      good_cols[remaining_cols3[fp_col]] <- NA
+    }
+  }
+
+  # coords
+  toe_line_mat <- matrix(NA, length(good_cols), 2)
+  dims <- pressure_data[[3]]
+  for (i in 1:length(good_cols)) {
+    if (is.na(good_cols[i]) != TRUE) {
+      xy <- c(-(dims[2] / 2) + (dims[2] * i),
+              (-(dims[1] / 2) + (nrow(pf_max) * dims[1]) - dims[1] * good_cols[i]))
+      toe_line_mat[i, ] <- xy
+    }
+  }
+  toe_line_mat <- na.omit(toe_line_mat)
+
+  # extend ends
+  toe_line_mat <- rbind(c(toe_line_mat[1, 1] - 1, toe_line_mat[1, 2]), toe_line_mat,
+                        c(toe_line_mat[nrow(toe_line_mat), 1] + 1,
+                          toe_line_mat[nrow(toe_line_mat), 2]))
+
+  #toe_path_df <- as.data.frame(cbind(toe_line_mat[, 1], toe_line_mat[, 2]))
+  #colnames(toe_path_df) <- c("x", "y")
+  #g <- plot_pressure(pressure_data)
+  #g <- g + geom_path(data = toe_path_df, aes(x = x, y = y), color = "red")
+  #g
+
+  # return
+  return(toe_line_mat)
+}
+
+
+#' @title edge lines
+#' @description create edge liens for footprint data
+#' @param mat Matrix
+#' @param side String
+#' @importFrom sf st_as_sfc st_combine st_coordinates st_convex_hull
+#' @importFrom utils head tail
+#' @noRd
+
+edge_lines <- function(pressure_data, side) {
+  # global variables
+  x <- y <- x_coord <- y_coord <- me <- sc_df <- NULL
+
+  # max pressure image
+  max_fp <- footprint(pressure_data, "max")
+
+  # coordinates
+  sens_coords <- sensor_coords(pressure_data)
+
+  # Find longest vectors (these are the med and lat edges of the footprint)
+  ## unique y coordinates of sensors
+  unq_y <- unique(sens_coords$y)
+
+  ## how much to shorten by
+  shorten_n <- ceiling(ncol(max_fp) / 10)
+  unq_y_short <- unq_y[-match(tail(sort(unq_y), shorten_n), unq_y)]
+  unq_y_short <- unq_y_short[-match(head(sort(unq_y_short), shorten_n),
+                                    unq_y_short)]
+
+  ## make edges
+  med_edge <- data.frame(x = rep(NA, length.out = length(unq_y_short)),
+                         y = unq_y_short)
+  lat_edge <- med_edge
+  for (i in 1:length(unq_y_short)) {
+    med_edge[i, 1] <- sens_coords %>% filter(y_coord == unq_y_short[i]) %>%
+      summarise(me = max(x_coord)) %>% pull(me)
+    lat_edge[i, 1] <- sens_coords %>% filter(y_coord == unq_y_short[i]) %>%
+      summarise(me = min(x_coord)) %>% pull(me)
+  }
+  if (side == "RIGHT") {
+    x <- med_edge
+    med_edge <- lat_edge
+    lat_edge <- x
+  }
+
+  ### convex hulls of edges
+  med_edge_sf <- med_edge %>% st_as_sf(coords = c("x", "y"))
+  med_edge_chull <- st_convex_hull(st_combine(med_edge_sf))
+  lat_edge_sf <- lat_edge %>% st_as_sf(coords = c("x", "y"))
+  lat_edge_chull <- st_convex_hull(st_combine(lat_edge_sf))
+
+  ## longest med and lateral edge line
+  me_dis <- as.matrix(dist(st_coordinates(med_edge_chull)))
+  me_dis <- me_dis[row(me_dis) == (col(me_dis) - 1)]
+  me_max <- order(me_dis)[length(me_dis)]
+  med_side <- st_coordinates(med_edge_chull)[c(me_max, me_max + 1), c(1, 2)]
+  med_side_line <- st_linestring(med_side)
+  med_side_line <- st_extend_line(med_side_line, 1)
+  le_dis <- as.matrix(dist(st_coordinates(lat_edge_chull)))
+  le_dis <- le_dis[row(le_dis) == (col(le_dis) - 1)]
+  le_max <- order(le_dis)[length(le_dis) - 1]
+  lat_side <- st_coordinates(lat_edge_chull)[c(le_max, le_max + 1), c(1, 2)]
+  lat_side_line <- st_linestring(lat_side)
+  lat_side_line <- st_extend_line(lat_side_line, 1)
+
+  # check that no points fall outside of line
+  if (side == "RIGHT") {
+    med_poly <- st_line2polygon(med_side_line, 1, "-X")  + c(-0.001, 0)
+    lat_poly <- st_line2polygon(lat_side_line, 1, "+X")  + c(0.001, 0)
+  }
+  #med_int <- st_intersects(st_as_sfc(med_edge_sf), med_poly)
+  #lat_int <- st_intersects(st_as_sfc(lat_edge_sf), lat_poly)
+
+  # if points do fall in poly, use fitted line approach
+
+  # return lines
+  return(list(med_side_line, lat_side_line))
+}
+
+
+#' Color binning function
+#' taken from ggplot2 codebase
+#' @noRd
+
+binned_pal <- function(palette) {
+  function(x) {
+    palette(length(x))
+  }
+}
+
+
+#' Rotate line
+#' @noRd
+#'
+rot_line <- function(line, ang, cnt) {
+  ang_ <- ang * pi /180
+  new_line <- (line - cnt) * matrix(c(cos(ang_), sin(ang_),
+                                      -sin(ang_), cos(ang_)), 2, 2) + cnt
+  return(new_line)
+}
+
+
+#' @title Visualize masks
+#' @description Visualize the existing masks
+#' @param pressure_data List. First item is a 3D array covering each timepoint
+#' of the measurement.
+#' @param visual_list List. Mask numbers that want to be viewed. (Default is
+#' all exisiting masks)
+#' @param image String."max" = footprint of maximum sensors. "mean"
+#'   average value of sensors over time
+#' @return ggplot plot object
+#' @examples
+#' \dontrun{
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' pressure_data <- automask(pressure_data, foot_side = "auto", plot = TRUE)
+#' plot_masks(pressure_data, image = "max")
+#' }
+#' @noRd
+
+plot_masks <- function(pressure_data,
+                       visual_list = seq(1, length(pressure_data[[5]])),
+                       image = "max"){
+  # global variables
+  X <- Y <- NULL
+
+  # initialize plot
+  grDevices::x11()
+
+  if (pressure_data[[2]] != "pedar"){
+    g <- plot_pressure(pressure_data, image, plot = FALSE)
+    g <- g + scale_x_continuous(expand = c(0, 0), limits = c(-0.01, 0.15))
+    g <- g + scale_y_continuous(expand = c(0, 0), limits = c(-0.01, 0.30))
+  }else{
+    if(image == "max"){
+      g <- plot_pressure(pressure_data, variable = "max", plot = FALSE)
+    }else if (is.numeric(image)){
+      g <- plot_pressure(pressure_data, frame = image, plot = FALSE)
+    }else{
+      stop("The variable image is invalid")
+    }
+  }
+  print(g)
+
+  # plot original mask data
+  for (n_mask in visual_list) {
+    g <- g + geom_path(data = data.frame(st_coordinates(pressure_data[[5]][[n_mask]])[,1:2]),
+                       aes(X, Y), color = "red", linewidth = 1)
+  }
+  print(g)
+
+  return(g)
+}
+
+
+#' @title Pedar mask regions
+#' @description Creates a mask region from pedar sensel coordinates
+#' @param pressure_data List.
+#' @param position Dataframe. A n x 3 dataframe of sensel coordinates
+#' [sensel id, x, y]
+#' @param sensel_list List. List of sensels to include
+#' @param foot_side String. "LEFT" for left foot, "RIGHT" for right foot
+#' @return polygon. A mask polygon
+#' @noRd
+
+pedar_polygon <- function(pressure_data, sensel_list, foot_side){
+
+  polygon_list <- sensor_2_polygon(pressure_data, pressure_image = "all_active",
+                                   frame = NA, output = "sf")
+
+  # Left foot sensels are stored as 1:99, right foot senses are 101:99
+  if (foot_side == "LEFT"){
+    sensel_list <- sensel_list + 99
+  }
+
+  sensel_polygon <- polygon_list[[sensel_list[1]]]
+
+  for (sensel_idx in sensel_list[-1]) {
+    if (class(st_intersection(sensel_polygon, polygon_list[[sensel_idx]]))[[2]]
+       %in% c("LINESTRING", "POLYGON", "MULTILINESTRING")) {
+       sensel_polygon <- st_union(sensel_polygon, polygon_list[[sensel_idx]])
+    } else {
+      stop("Sensels used to define a mask must share an edge")
+    }
+  }
+
+  return(sensel_polygon)
+}
+
+
+#' @title Peak pressure
+#' @description get highest value of sensor in mask
+#' @noRd
+
+pressure_peak <- function(pressure_data, sens_mask_df,
+                          mask_sides, output_df, pressure_units) {
+  # global variables
+  act_sens <- masks <- NULL
+
+  # events
+  events <- pressure_data[[6]]
+
+  # output_names
+  col_names <- colnames(output_df)
+
+  # pressure variable
+  pv <- "press_peak_sensor"
+
+  # side
+  time <- side <- NA
+
+  # process
+  if (length(pressure_data[[6]]) == 0) {
+    n_cycle = 1
+  } else {
+    n_cycle = nrow(pressure_data[[6]])
+  }
+  for (cycle in 1:n_cycle) {
+    # get step data
+    pressure_data_ <- pressure_data
+    if (n_cycle > 1) {
+      cyc_str <- unname(unlist(pressure_data[[6]][cycle, 2]))
+      cyc_end <- unname(unlist(pressure_data[[6]][cycle, 3]))
+      pressure_data_[[1]] <- pressure_data_[[1]][, , c(cyc_str:cyc_end)]
+    }
+
+    # non-pedar data
+    if (pressure_data[[2]] != "pedar") {
+      P <- c(footprint(pressure_data_))
+      act_sens <- which(footprint(pressure_data_, "max") > 0)
+      P <- P[act_sens]
+    }
+
+    # pedar data
+    if (pressure_data[[2]] == "pedar" & length(events) > 0) {
+      P <- c(footprint(pressure_data_))
+    }
+
+    # analysis
+    for (mask in seq_along(pressure_data[[5]])) {
+      mn <- names(pressure_data[[5]])[mask]
+      if (pressure_data[[2]] != "pedar") {
+        val <- max(P[which(sens_mask_df[, mask] > 0)])
+        output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+      }
+      if (pressure_data[[2]] == "pedar") {
+        if (mask_sides[mask] == events[cycle, 1]) {
+          val <- max(P[which(sens_mask_df[, mask] > 0)])
+          side <- mask_sides[mask]
+          output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+        }
+      }
+    }
+  }
+
+  # fix col names
+  colnames(output_df) <- col_names
+
+  # adjust units
+  if (pressure_units == "MPa") {output_df$value <- output_df$value * 0.001}
+  if (pressure_units == "Ncm2") {output_df$value <- output_df$value * 0.1}
+
+  # return
+  return(output_df)
+}
+
+
+#' @title Mean regional pressure
+#' @description get average pressure across mask
+#' @noRd
+
+pressure_mean <- function(pressure_data, sens_mask_df, mask_sides,
+                          output_df, pressure_units) {
+  # global variables
+  act_sens <- masks <- NULL
+
+  # events
+  events <- pressure_data[[6]]
+
+  # output_names
+  col_names <- colnames(output_df)
+
+  # pressure variable
+  pv <- "press_peak_mask"
+
+  # side
+  time <- side <- NA
+
+  # process
+  if (length(pressure_data[[6]]) == 0) {
+    n_cycle = 1
+  } else {
+    n_cycle = nrow(pressure_data[[6]])
+  }
+  for (cycle in 1:n_cycle) {
+    # get step data
+    pressure_data_ <- pressure_data
+    if (n_cycle > 1) {
+      cyc_str <- unname(unlist(pressure_data[[6]][cycle, 2]))
+      cyc_end <- unname(unlist(pressure_data[[6]][cycle, 3]))
+      pressure_data_[[1]] <- pressure_data_[[1]][, , c(cyc_str:cyc_end)]
+    }
+
+    # non-pedar data
+    if (pressure_data[[2]] != "pedar") {
+      sensor_area <- pressure_data[[3]][1] * pressure_data[[3]][2]
+      P <- c(footprint(pressure_data_))
+      act_sens <- which(footprint(pressure_data_, "max") > 0)
+      P <- P[act_sens] * sensor_area * 1000
+      CA <- rep(sensor_area, length.out = length(P))
+    }
+
+    # pedar data
+    if (pressure_data[[2]] == "pedar" & length(events) > 0) {
+      pedar_insole_areas <- pedar_insole_area()
+      pedarSensorAreas <- as.vector(pedar_insole_areas[[pressure_data[[3]]]] *
+                                      0.001)
+      pedarSensorAreas <- c(pedarSensorAreas, pedarSensorAreas)
+      P <- c(footprint(pressure_data_)) * pedarSensorAreas
+    }
+
+    # analysis
+    for (mask in seq_along(pressure_data[[5]])) {
+      mn <- names(pressure_data[[5]])[mask]
+      if (pressure_data[[2]] != "pedar") {
+        force <- sum(P * sens_mask_df[, mask])
+        contact_area <- sum(CA * sens_mask_df[, mask])
+        val <- force / contact_area / 1000
+        output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+      }
+      if (pressure_data[[2]] == "pedar") {
+        if (mask_sides[mask] == events[cycle, 1]) {
+          val <- max(P[which(sens_mask_df[, mask] > 0)])
+          side <- mask_sides[mask]
+          force <- sum(P * sens_mask_df[, mask])
+          contact_area <- sum(pedarSensorAreas * sens_mask_df[, mask])
+          val <- force / contact_area
+          output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+        }
+      }
+    }
+  }
+
+  # fix col names
+  colnames(output_df) <- col_names
+
+  # adjust units
+  if (pressure_units == "MPa") {output_df$value <- output_df$value * 0.001}
+  if (pressure_units == "Ncm2") {output_df$value <- output_df$value * 0.1}
+
+  # return
+  return(output_df)
+}
+
+#' @title Contact area by mask
+#' @description get contact areas for masks
+#' @noRd
+
+contact_area <- function(pressure_data, sens_mask_df, mask_sides,
+                         output_df, area_units) {
+  # global variables
+  act_sens <- masks <- NULL
+
+  # events
+  events <- pressure_data[[6]]
+
+  # output_names
+  col_names <- colnames(output_df)
+
+  # pressure variable
+  pv <- "contact_area"
+
+  # side
+  time <- side <- NA
+
+  # process
+  if (length(pressure_data[[6]]) == 0) {
+    n_cycle = 1
+  } else {
+    n_cycle = nrow(pressure_data[[6]])
+  }
+  for (cycle in 1:n_cycle) {
+    # get step data
+    pressure_data_ <- pressure_data
+    if (n_cycle > 1) {
+      cyc_str <- unname(unlist(pressure_data[[6]][cycle, 2]))
+      cyc_end <- unname(unlist(pressure_data[[6]][cycle, 3]))
+      pressure_data_[[1]] <- pressure_data_[[1]][, , c(cyc_str:cyc_end)]
+    }
+
+    # non-pedar data
+    if (pressure_data[[2]] != "pedar") {
+      sensor_area <- pressure_data[[3]][1] * pressure_data[[3]][2]
+      act_sens <- which(footprint(pressure_data, "max") > 0)
+      CA <- rep(sensor_area, length.out = length(act_sens))
+    }
+
+    # pedar data
+    if (pressure_data[[2]] == "pedar" & length(events) > 0) {
+      pedar_insole_areas <- pedar_insole_area()
+      pedarSensorAreas <- as.vector(pedar_insole_areas[[pressure_data[[3]]]] *
+                                      1e-6)
+      pedarSensorAreas <- c(pedarSensorAreas, pedarSensorAreas)
+      CA2 <- (c(footprint(pressure_data_)) > 0) * pedarSensorAreas
+    }
+
+    # analysis
+    for (mask in seq_along(pressure_data[[5]])) {
+      mn <- names(pressure_data[[5]])[mask]
+      if (pressure_data[[2]] != "pedar") {
+        val <- sum(CA * sens_mask_df[, mask])
+        output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+      }
+      if (pressure_data[[2]] == "pedar") {
+        if (mask_sides[mask] == events[cycle, 1]) {
+          side <- mask_sides[mask]
+          val <- sum(CA2 * sens_mask_df[, mask])
+          output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+        }
+      }
+    }
+  }
+
+  # fix output
+  colnames(output_df) <- col_names
+  output_df$value <- as.numeric(output_df$value)
+
+  # units
+  if (area_units == "cm2") {output_df$value <- output_df$value * 1e4}
+  if (area_units == "mm2") {output_df$value <- output_df$value * 1e6}
+
+  # return
+  return(output_df)
+}
+
+
+#' @title Pressure time integral (Novel)
+#' @description calculate PTI (as defined by novel) for pressure data
+#' @noRd
+
+pti_1 <- function(pressure_data, sens_mask_df, mask_sides,
+                  output_df, pressure_units) {
+  # global variables
+  act_sens <- masks <- NULL
+
+  # events df
+  events <- pressure_data[[6]]
+
+  # output_names
+  col_names <- colnames(output_df)
+
+  # pressure variable
+  pv <- "pti_novel"
+
+  # side
+  time <- side <- NA
+
+  # process
+  if (length(pressure_data[[6]]) == 0) {
+    n_cycle = 1
+  } else {
+    n_cycle = nrow(pressure_data[[6]])
+  }
+  for (cycle in 1:n_cycle) {
+    # get step data
+    pressure_data_ <- pressure_data
+    if (n_cycle > 1) {
+      cyc_str <- unname(unlist(pressure_data[[6]][cycle, 2]))
+      cyc_end <- unname(unlist(pressure_data[[6]][cycle, 3]))
+      pressure_data_[[1]] <- pressure_data_[[1]][, , c(cyc_str:cyc_end)]
+    }
+
+    # non-pedar data
+    if (pressure_data[[2]] != "pedar") {
+      P <- c(footprint(pressure_data_))
+      act_sens <- which(footprint(pressure_data_, "max") > 0)
+      P <- P[act_sens]
+    }
+
+    # pedar data
+    if (pressure_data[[2]] == "pedar" & length(events) > 0) {
+      P <- c(footprint(pressure_data_))
+    }
+
+    # analysis
+    for (mask in seq_along(pressure_data[[5]])) {
+      mn <- names(pressure_data[[5]])[mask]
+      if (pressure_data[[2]] != "pedar") {
+        mask_pp <- rep(NA, length.out = dim(pressure_data_[[1]])[3])
+        for (i in 1:(dim(pressure_data_[[1]])[3])) {
+          P <- c(pressure_data_[[1]][, , i])
+          P <- P[act_sens]
+          mask_pp[i] <- max(P[which(sens_mask_df[, mask] > 0)]) *
+            pressure_data_[[4]]
+        }
+        val <- sum(mask_pp)
+        output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+      }
+      if (pressure_data[[2]] == "pedar") {
+        if (mask_sides[mask] == events[cycle, 1]) {
+          mask_pp <- rep(NA, length.out = dim(pressure_data_[[1]])[3])
+          for (i in 1:(dim(pressure_data_[[1]])[3])) {
+            P <- c(pressure_data_[[1]][, , i])
+            mask_pp[i] <- max(P[which(sens_mask_df[, mask] > 0)]) *
+              pressure_data_[[4]]
+          }
+          val <- sum(mask_pp)
+          side <- mask_sides[mask]
+          output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+        }
+      }
+    }
+  }
+
+  # fix output
+  colnames(output_df) <- col_names
+  output_df$value <- as.numeric(output_df$value)
+
+  # units
+  if (pressure_units == "MPa") {output_df$value <- output_df$value * 0.001}
+  if (pressure_units == "Ncm2") {output_df$value <- output_df$value * 0.1}
+
+  # return
+  return(output_df)
+}
+
+
+#' @title Pressure time integral (Melai)
+#' @description calculate PTI (as defined by Melai) for pressure data
+#' @noRd
+
+pti_2 <- function(pressure_data, sens_mask_df, mask_sides,
+                  output_df, pressure_units) {
+  # global variables
+  act_sens <- masks <- NULL
+
+  # events df
+  events <- pressure_data[[6]]
+
+  # output_names
+  col_names <- colnames(output_df)
+
+  # pressure variable
+  pv <- "pti_Melai"
+
+  # side
+  time <- side <- NA
+
+  # process
+  if (length(pressure_data[[6]]) == 0) {
+    n_cycle = 1
+  } else {
+    n_cycle = nrow(pressure_data[[6]])
+  }
+  for (cycle in 1:n_cycle) {
+    # get step data
+    pressure_data_ <- pressure_data
+    if (n_cycle > 1) {
+      cyc_str <- unname(unlist(pressure_data[[6]][cycle, 2]))
+      cyc_end <- unname(unlist(pressure_data[[6]][cycle, 3]))
+      pressure_data_[[1]] <- pressure_data_[[1]][, , c(cyc_str:cyc_end)]
+    }
+
+    # non-pedar data
+    if (pressure_data[[2]] != "pedar") {
+      sensor_area <- pressure_data_[[3]][1] * pressure_data_[[3]][2]
+      act_sens <- which(footprint(pressure_data_, "max") > 0)
+    }
+
+    # pedar data
+    if (pressure_data[[2]] == "pedar" & length(events) > 0) {
+      P <- c(footprint(pressure_data_))
+      pedar_insole_areas <- pedar_insole_area()
+      pedarSensorAreas <- as.vector(pedar_insole_areas[[pressure_data[[3]]]] *
+                                      1e-6)
+      pedarSensorAreas <- c(pedarSensorAreas, pedarSensorAreas)
+    }
+
+    # analysis
+    for (mask in seq_along(pressure_data[[5]])) {
+      mn <- names(pressure_data[[5]])[mask]
+      if (pressure_data[[2]] != "pedar") {
+        force <- rep(NA, length.out = dim(pressure_data_[[1]])[3])
+        for (i in 1:(dim(pressure_data_[[1]])[3])) {
+          P <- c(pressure_data_[[1]][, , i])
+          P <- P[act_sens] * sensor_area * 1000
+          force[i] <- sum(P * sens_mask_df[, mask])
+        }
+        CA <- rep(sensor_area, length.out = length(act_sens))
+        CA <- sum(CA * sens_mask_df[, mask])
+        val <- pracma::trapz(seq(0, by = pressure_data_[[4]],
+                                 length.out = dim(pressure_data_[[1]])[3]),
+                             force) / CA / 1000
+        output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+      }
+      if (pressure_data[[2]] == "pedar") {
+        if (mask_sides[mask] == events[cycle, 1]) {
+          force <- rep(NA, length.out = dim(pressure_data_[[1]])[3])
+          for (i in 1:(dim(pressure_data_[[1]])[3])) {
+            P <- c(pressure_data_[[1]][, , i]) * pedarSensorAreas
+            force[i] <- sum(P * sens_mask_df[, mask]) / 1000
+          }
+          CA <- sum(pedarSensorAreas * sens_mask_df[, mask])
+          val <- pracma::trapz(seq(0, by = pressure_data_[[4]],
+                                   length.out = dim(pressure_data_[[1]])[3]),
+                               force) / CA * 1000
+          side <- mask_sides[mask]
+          output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+        }
+      }
+    }
+  }
+
+  # fix output
+  colnames(output_df) <- col_names
+  output_df$value <- as.numeric(output_df$value)
+
+  # units
+  if (pressure_units == "MPa") {output_df$value <- output_df$value * 0.001}
+  if (pressure_units == "Ncm2") {output_df$value <- output_df$value * 0.1}
+
+  # return
+  return(output_df)
+}
+
+
+#' @title Force time integral
+#' @description Calculate FTI
+#' @noRd
+
+fti <- function(pressure_data, sens_mask_df, mask_sides,
+                output_df) {
+  # global variables
+  act_sens <- masks <- NULL
+
+  # events df
+  events <- pressure_data[[6]]
+
+  # output_names
+  col_names <- colnames(output_df)
+
+  # pressure variable
+  pv <- "fti"
+
+  # side
+  time <- side <- NA
+
+  # process
+  if (length(pressure_data[[6]]) == 0) {
+    n_cycle = 1
+  } else {
+    n_cycle = nrow(pressure_data[[6]])
+  }
+  for (cycle in 1:n_cycle) {
+    # get step data
+    pressure_data_ <- pressure_data
+    if (n_cycle > 1) {
+      cyc_str <- unname(unlist(pressure_data[[6]][cycle, 2]))
+      cyc_end <- unname(unlist(pressure_data[[6]][cycle, 3]))
+      pressure_data_[[1]] <- pressure_data_[[1]][, , c(cyc_str:cyc_end)]
+    }
+
+    # non-pedar data
+    if (pressure_data[[2]] != "pedar") {
+      sensor_area <- pressure_data_[[3]][1] * pressure_data_[[3]][2]
+      act_sens <- which(footprint(pressure_data_, "max") > 0)
+    }
+
+    # pedar data
+    if (pressure_data[[2]] == "pedar" & length(events) > 0) {
+      P <- c(footprint(pressure_data_))
+      pedar_insole_areas <- pedar_insole_area()
+      pedarSensorAreas <- as.vector(pedar_insole_areas[[pressure_data[[3]]]] *
+                                      1e-3)
+      pedarSensorAreas <- c(pedarSensorAreas, pedarSensorAreas)
+    }
+
+    # analysis
+    for (mask in seq_along(pressure_data[[5]])) {
+      mn <- names(pressure_data[[5]])[mask]
+      if (pressure_data[[2]] != "pedar") {
+        force <- rep(NA, length.out = dim(pressure_data_[[1]])[3])
+        for (i in 1:(dim(pressure_data_[[1]])[3])) {
+          P <- c(pressure_data_[[1]][, , i])
+          P <- P[act_sens] * sensor_area * 1000
+          force[i] <- sum(P * sens_mask_df[, mask])
+        }
+        val <- pracma::trapz(seq(0, by = pressure_data_[[4]],
+                                 length.out = dim(pressure_data_[[1]])[3]),
+                             force)
+        output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+      }
+      if (pressure_data[[2]] == "pedar") {
+        if (mask_sides[mask] == events[cycle, 1]) {
+          force <- rep(NA, length.out = dim(pressure_data_[[1]])[3])
+          for (i in 1:(dim(pressure_data_[[1]])[3])) {
+            P <- c(pressure_data_[[1]][, , i]) * pedarSensorAreas
+            force[i] <- sum(P * sens_mask_df[, mask])
+          }
+          val <- pracma::trapz(seq(0, by = pressure_data_[[4]],
+                                   length.out = dim(pressure_data_[[1]])[3]),
+                               force)
+          side <- mask_sides[mask]
+          output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+        }
+      }
+    }
+  }
+
+  # fix output
+  colnames(output_df) <- col_names
+  output_df$value <- as.numeric(output_df$value)
+
+  # return
+  return(output_df)
+}
+
+
+#' @title Force peak
+#' @description Calculate force peak
+#' @noRd
+
+force_peak <- function(pressure_data, sens_mask_df, mask_sides,
+                       output_df) {
+  # global variables
+  act_sens <- masks <- NULL
+
+  # events df
+  events <- pressure_data[[6]]
+
+  # output_names
+  col_names <- colnames(output_df)
+
+  # pressure variable
+  pv <- "force_peak"
+
+  # side
+  time <- side <- NA
+
+  # process
+  if (length(pressure_data[[6]]) == 0) {
+    n_cycle = 1
+  } else {
+    n_cycle = nrow(pressure_data[[6]])
+  }
+  for (cycle in 1:n_cycle) {
+    # get step data
+    pressure_data_ <- pressure_data
+    if (n_cycle > 1) {
+      cyc_str <- unname(unlist(pressure_data[[6]][cycle, 2]))
+      cyc_end <- unname(unlist(pressure_data[[6]][cycle, 3]))
+      pressure_data_[[1]] <- pressure_data_[[1]][, , c(cyc_str:cyc_end)]
+    }
+
+    # non-pedar data
+    if (pressure_data[[2]] != "pedar") {
+      sensor_area <- pressure_data_[[3]][1] * pressure_data_[[3]][2]
+      act_sens <- which(footprint(pressure_data_, "max") > 0)
+    }
+
+    # pedar data
+    if (pressure_data[[2]] == "pedar" & length(events) > 0) {
+      P <- c(footprint(pressure_data_))
+      pedar_insole_areas <- pedar_insole_area()
+      pedarSensorAreas <- as.vector(pedar_insole_areas[[pressure_data[[3]]]] *
+                                      1e-3)
+      pedarSensorAreas <- c(pedarSensorAreas, pedarSensorAreas)
+    }
+
+    # analysis
+    for (mask in seq_along(pressure_data[[5]])) {
+      mn <- names(pressure_data[[5]])[mask]
+      if (pressure_data[[2]] != "pedar") {
+        force <- rep(NA, length.out = dim(pressure_data_[[1]])[3])
+        for (i in 1:(dim(pressure_data_[[1]])[3])) {
+          P <- c(pressure_data_[[1]][, , i])
+          P <- P[act_sens] * sensor_area * 1000
+          force[i] <- sum(P * sens_mask_df[, mask])
+        }
+        val <- max(force)
+        output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+      }
+      if (pressure_data[[2]] == "pedar") {
+        if (mask_sides[mask] == events[cycle, 1]) {
+          force <- rep(NA, length.out = dim(pressure_data_[[1]])[3])
+          for (i in 1:(dim(pressure_data_[[1]])[3])) {
+            P <- c(pressure_data_[[1]][, , i]) * pedarSensorAreas
+            force[i] <- sum(P * sens_mask_df[, mask])
+          }
+          val <- max(force)
+          side <- mask_sides[mask]
+          output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+        }
+      }
+    }
+  }
+
+  # fix output
+  colnames(output_df) <- col_names
+  output_df$value <- as.numeric(output_df$value)
+
+  # return
+  return(output_df)
+}
+
+
+#' @title threshold event
+#' @description defines threshold based on force value
+#' @noRd
+threshold_event <- function(pressure_data, threshold, min_frames, side) {
+  # make force vector
+  if (pressure_data[[2]] != "pedar") {
+    force <- whole_pressure_curve(pressure_data, "force")
+  } else {
+    if (side == "RIGHT") {force <- force_pedar(pressure_data)[, 1]}
+    if (side == "LEFT") {force <- force_pedar(pressure_data)[, 2]}
+  }
+
+  # Adjust thresholds to avoid errors
+  threshold <- threshold + 0.01
+
+  # throw error if threshold is less than min of trial
+  min_f <- min(force)
+  if (min_f > threshold)
+    stop("threshold is less than minimum force recorded in trial")
+
+  # Get events
+  FS_events <- which(force[-length(force)] < threshold &
+                       force[-1] > threshold) + 1
+  FO_events <- which(force[-length(force)] > threshold &
+                       force[-1] < threshold) + 1
+
+  # Create steps
+  ## Adjust events to ensure stance phase is used
+  if (FO_events[1] < FS_events[1]) {FO_events <- FO_events[-1]}
+  if ((length(FS_events)) > (length(FO_events))) {
+    FS_events <- FS_events[-length(FS_events)]
+  }
+
+  # remove short steps
+  rm_stp <- c()
+  for (i in 1:length(FS_events)) {
+    if (FO_events[i] - FS_events[i] < min_frames) {rm_stp <- c(rm_stp, i)}
+  }
+  FS_events <- FS_events[-rm_stp]
+  FO_events <- FO_events[-rm_stp]
+
+  # Make steps into data frame
+  df <- data.frame(step = integer(), frame = integer(), force = double())
+  for (i in 1:length(FS_events)) {
+    force_step <- force[FS_events[i]:FO_events[i]]
+    step <- data.frame(step = rep(i, length_out = length(force_step)),
+                       frame = c(1:length(force_step)),
+                       force = force_step)
+    df <- rbind(df, step)
+  }
+
+  # return
+  return(list(df, FS_events, FO_events))
+}
+
+
+#' @title approve step
+#' @description asks user to approve step
+#' @noRd
+approve_step <- function(df, on_v, off_v, n_steps, side = "none") {
+  # global variables
+  step <- frame <- NULL
+
+  # Approve or discard steps
+  include_stps <- c()
+  for (stp in 1:length(on_v)) {
+    # highlighted step df
+    df1 <- df %>% filter(step %in% stp)
+
+    # plot
+    g <- ggplot()
+    g <- g + geom_line(data = df, aes(x = frame, y = force, group = step),
+                       linewidth = 1.5, color = "grey")
+    g <- g + geom_line(data = df1, aes(x = frame, y = force),
+                       linewidth = 1.5, color = "red")
+    g <- g + xlab("Frame no") + ylab("Force (N)")
+    g <- g + ggtitle(paste0(side, " ", stp))
+    print(g)
+    Sys.sleep(1.0)
+
+    # get user to approve or reject step
+    resp <- menu(c("Y", "N", "EXIT"),
+                 title = "Do you want to keep (Y) or discard (N) this step?")
+    if (resp == 3) {
+      break
+    } else {
+      include_stps <- c(include_stps, resp)
+    }
+
+    # check if number of steps has been reached
+    if (sum(include_stps == 1) >= n_steps) {break}
+  }
+
+  # make events df
+  len_ <- length(which(include_stps == 1))
+  event_df <- data.frame(side = rep(side, length.out = len_),
+                         FON = on_v[which(include_stps == 1)],
+                         FOFF = off_v[which(include_stps == 1)])
+
+  # return
+  return(event_df)
+}
+
+
+# data
+pedar_insole_area <- function() {
+  pedar_insole_areas <- data.frame(u = c(126, 129, 129, 129, 129, 126, 126, 125,
+                                         126, 126, 126, 126, 129, 129, 129, 129,
+                                         129, 129, 129, 126, 126, 127, 126, 126,
+                                         126, 127, 127, 127, 128, 127, 127, 127,
+                                         127, 131, 130, 131, 130, 131, 131, 130,
+                                         126, 126, 125, 126, 126, 126, 126, 126,
+                                         126, 125, 126, 126, 126, 126, 129, 129,
+                                         129, 129, 129, 129, 128, 127, 127, 128,
+                                         127, 127, 127, 127, 129, 129, 130, 129,
+                                         129, 129, 129, 128, 127, 128, 127, 128,
+                                         127, 128, 126, 126, 126, 126, 126, 125,
+                                         126, 123, 122, 123, 123, 123, 123, 126,
+                                         126, 127, 127),
+                                   v = c(139, 143, 143, 142, 143, 139, 139, 139,
+                                         139, 139, 139, 139, 143, 143, 143, 143,
+                                         143, 143, 143, 139, 139, 139, 139, 139,
+                                         139, 139, 141, 141, 141, 141, 141, 141,
+                                         141, 144, 144, 144, 144, 144, 144, 144,
+                                         139, 139, 139, 139, 139, 139, 139, 140,
+                                         140, 140, 140, 140, 140, 140, 143, 143,
+                                         143, 143, 143, 143, 143, 140, 140, 140,
+                                         140, 140, 140, 140, 144, 144, 144, 144,
+                                         144, 144, 144, 141, 141, 141, 141, 141,
+                                         141, 141, 139, 139, 139, 139, 139, 139,
+                                         139, 136, 136, 136, 136, 136, 136, 140,
+                                         140, 141, 140),
+                                   w = c(155, 160, 159, 159, 159, 155, 155, 155,
+                                         155, 156, 155, 155, 158, 160, 158, 158,
+                                         160, 158, 160, 155, 156, 155, 155, 156,
+                                         154, 156, 158, 159, 158, 159, 158, 158,
+                                         158, 160, 161, 160, 161, 160, 161, 160,
+                                         155, 155, 155, 155, 155, 155, 155, 157,
+                                         157, 156, 157, 157, 157, 157, 158, 159,
+                                         158, 159, 159, 159, 159, 156, 157, 158,
+                                         157, 157, 157, 157, 160, 159, 160, 160,
+                                         159, 160, 159, 159, 158, 158, 158, 158,
+                                         158, 158, 155, 155, 155, 155, 155, 155,
+                                         155, 151, 152, 151, 151, 151, 151, 156,
+                                         156, 157, 156),
+                                   x = c(172, 176, 176, 176, 176, 172, 172, 172,
+                                         172, 172, 172, 172, 176, 176, 176, 176,
+                                         176, 176, 176, 172, 172, 172, 172, 172,
+                                         172, 172, 175, 175, 175, 175, 175, 175,
+                                         175, 178, 178, 178, 178, 178, 178, 178,
+                                         172, 172, 172, 172, 172, 172, 172, 173,
+                                         173, 173, 173, 173, 173, 173, 176, 176,
+                                         176, 176, 176, 176, 176, 173, 173, 173,
+                                         173, 173, 173, 173, 178, 178, 178, 178,
+                                         178, 178, 178, 174, 174, 174, 174, 174,
+                                         174, 174, 171, 171, 171, 171, 171, 171,
+                                         171, 168, 168, 168, 168, 168, 168, 173,
+                                         173, 174, 174),
+                                   y = c(192, 195, 197, 197, 196, 191, 191, 191,
+                                         191, 191, 192, 191, 196, 196, 196, 196,
+                                         196, 197, 195, 192, 190, 189, 192, 191,
+                                         191, 189, 195, 193, 194, 195, 194, 195,
+                                         193, 197, 197, 197, 197, 197, 199, 196,
+                                         191, 191, 190, 191, 191, 191, 190, 192,
+                                         192, 192, 192, 191, 192, 192, 196, 196,
+                                         196, 196, 196, 196, 196, 191, 193, 192,
+                                         191, 193, 192, 192, 197, 198, 197, 197,
+                                         197, 197, 198, 195, 194, 194, 194, 193,
+                                         194, 194, 191, 190, 191, 190, 191, 190,
+                                         190, 187, 186, 187, 186, 187, 186, 192,
+                                         191, 193, 192),
+                                   uw = c(114, 101, 107, 101, 114, 103, 115, 114,
+                                          115, 114, 113, 105, 121, 123, 122, 122,
+                                          122, 121, 123, 127, 129, 128, 127, 128,
+                                          128, 128, 135, 136, 136, 135, 136, 137,
+                                          135, 141, 142, 141, 142, 141, 143, 141,
+                                          149, 150, 149, 150, 149, 150, 148, 155,
+                                          155, 156, 155, 155, 156, 154, 156, 159,
+                                          162, 162, 164, 167, 167, 160, 164, 165,
+                                          168, 171, 173, 174, 163, 166, 167, 170,
+                                          170, 173, 176, 158, 160, 162, 164, 165,
+                                          170, 170, 137, 147, 148, 150, 151, 154,
+                                          155, 210, 132, 133, 135, 248, 67, 98,
+                                          110, 108, 104),
+                                   xw = c(158, 140, 149, 140, 158, 145, 158, 158,
+                                          159, 158, 158, 145, 170, 168, 169, 169,
+                                          169, 168, 170, 179, 177, 179, 178, 179,
+                                          177, 179, 188, 187, 188, 187, 188, 187,
+                                          188, 196, 196, 196, 195, 196, 196, 196,
+                                          207, 206, 206, 207, 206, 206, 207, 217,
+                                          215, 216, 216, 216, 215, 217, 233, 229,
+                                          229, 225, 222, 218, 218, 242, 238, 235,
+                                          233, 230, 226, 224, 242, 240, 238, 235,
+                                          232, 229, 226, 235, 234, 230, 227, 224,
+                                          222, 218, 216, 213, 210, 208, 206, 205,
+                                          189, 343, 186, 185, 182, 290, 144, 149,
+                                          154, 134, 93),
+                                   vw = c(128, 113, 120, 113, 128, 117, 129, 127,
+                                          128, 129, 127, 117, 136, 137, 136, 136,
+                                          137, 136, 136, 144, 144, 143, 144, 144,
+                                          143, 144, 152, 153, 151, 152, 153, 151,
+                                          152, 158, 159, 158, 158, 159, 158, 158,
+                                          168, 168, 167, 168, 168, 167, 168, 175,
+                                          176, 174, 175, 176, 174, 175, 188, 186,
+                                          183, 181, 180, 177, 175, 196, 193, 191,
+                                          189, 187, 184, 181, 197, 195, 193, 190,
+                                          187, 185, 183, 190, 189, 186, 183, 182,
+                                          181, 177, 175, 172, 170, 169, 167, 165,
+                                          153, 276, 152, 149, 147, 235, 116, 122,
+                                          124, 109, 76))
+  return(pedar_insole_areas)
+}
+
+pedar_insole_grids <- function() {
+  pedar_insole_grid <- data.frame(V1 = c(0.643, 0.671, 0.696, 0.726, 0.778, 0.608,
+                                         0.636, 0.664, 0.696, 0.726, 0.758, 0.786,
+                                         0.604, 0.632, 0.664, 0.696, 0.728, 0.758,
+                                         0.788, 0.6, 0.632, 0.664, 0.692, 0.724,
+                                         0.758, 0.79, 0.596, 0.628, 0.66, 0.692,
+                                         0.726, 0.758, 0.79, 0.592, 0.624, 0.656,
+                                         0.692, 0.726, 0.758, 0.79, 0.588, 0.62,
+                                         0.656, 0.688, 0.722, 0.758, 0.79, 0.568,
+                                         0.604, 0.64, 0.676, 0.714, 0.754, 0.79,
+                                         0.552, 0.592, 0.632, 0.672, 0.71, 0.75,
+                                         0.79, 0.546, 0.584, 0.624, 0.664, 0.71,
+                                         0.75, 0.79, 0.536, 0.576, 0.62, 0.66,
+                                         0.702, 0.742, 0.782, 0.536, 0.572, 0.612,
+                                         0.652, 0.692, 0.728, 0.77, 0.536, 0.572,
+                                         0.608, 0.64, 0.676, 0.714, 0.744, 0.554,
+                                         0.584, 0.616, 0.652, 0.684, 0.708, 0.572,
+                                         0.604, 0.636, 0.68, NA, 0.157, 0.129,
+                                         0.104, 0.074, 0.022, 0.192, 0.164, 0.136,
+                                         0.104, 0.074, 0.042, 0.014, 0.196, 0.168,
+                                         0.136, 0.104, 0.072, 0.042, 0.012, 0.2,
+                                         0.168, 0.136, 0.108, 0.076, 0.042, 0.01,
+                                         0.204, 0.172, 0.14, 0.108, 0.074, 0.042,
+                                         0.01, 0.208, 0.176, 0.144, 0.108, 0.074,
+                                         0.042, 0.01, 0.212, 0.18, 0.144, 0.112,
+                                         0.078, 0.042, 0.01, 0.232, 0.196, 0.16,
+                                         0.124, 0.086, 0.046, 0.01, 0.248, 0.208,
+                                         0.168, 0.128, 0.09, 0.05, 0.01, 0.254,
+                                         0.216, 0.176, 0.136, 0.09, 0.05, 0.01,
+                                         0.264, 0.224, 0.18, 0.14, 0.098, 0.058,
+                                         0.018, 0.264, 0.228, 0.188, 0.148, 0.108,
+                                         0.072, 0.03, 0.264, 0.228, 0.192, 0.16,
+                                         0.124, 0.086, 0.056, 0.246, 0.216, 0.184,
+                                         0.148, 0.116, 0.092, 0.228, 0.196, 0.164,
+                                         0.12),
+                                  V2 = c(0.154, 0.154, 0.154, 0.154, 0.154, 0.227,
+                                         0.227, 0.227, 0.227, 0.227, 0.227, 0.227,
+                                         0.295, 0.295, 0.295, 0.295, 0.295, 0.295,
+                                         0.295, 0.36, 0.36, 0.36, 0.36, 0.36,
+                                         0.36, 0.36, 0.424, 0.424, 0.424, 0.424,
+                                         0.424, 0.424, 0.424, 0.492, 0.492, 0.492,
+                                         0.492, 0.492, 0.492, 0.492, 0.552, 0.552,
+                                         0.552, 0.552, 0.552, 0.552, 0.552, 0.612,
+                                         0.612, 0.612, 0.612, 0.612, 0.612, 0.612,
+                                         0.664, 0.664, 0.664, 0.664, 0.664, 0.664,
+                                         0.664, 0.716, 0.716, 0.716, 0.716, 0.716,
+                                         0.716, 0.716, 0.77, 0.77, 0.77, 0.77,
+                                         0.77, 0.77, 0.77, 0.822, 0.822, 0.822,
+                                         0.822, 0.822, 0.822, 0.822, 0.878, 0.878,
+                                         0.878, 0.878, 0.878, 0.878, 0.878, 0.931,
+                                         0.931, 0.931, 0.931, 0.931, 0.931, 0.99,
+                                         0.995, 0.99, 0.967, NA, 0.154, 0.154,
+                                         0.154, 0.154, 0.154, 0.227, 0.227, 0.227,
+                                         0.227, 0.227, 0.227, 0.227, 0.295, 0.295,
+                                         0.295, 0.295, 0.295, 0.295, 0.295, 0.36,
+                                         0.36, 0.36, 0.36, 0.36, 0.36, 0.36,
+                                         0.424, 0.424, 0.424, 0.424, 0.424, 0.424,
+                                         0.424, 0.492, 0.492, 0.492, 0.492, 0.492,
+                                         0.492, 0.492, 0.552, 0.552, 0.552, 0.552,
+                                         0.552, 0.552, 0.552, 0.612, 0.612, 0.612,
+                                         0.612, 0.612, 0.612, 0.612, 0.664, 0.664,
+                                         0.664, 0.664, 0.664, 0.664, 0.664, 0.716,
+                                         0.716, 0.716, 0.716, 0.716, 0.716, 0.716,
+                                         0.77, 0.77, 0.77, 0.77, 0.77, 0.77, 0.77,
+                                         0.822, 0.822, 0.822, 0.822, 0.822, 0.822,
+                                         0.822, 0.878, 0.878, 0.878, 0.878, 0.878,
+                                         0.878, 0.878, 0.931, 0.931, 0.931, 0.931,
+                                         0.931, 0.931, 0.99, 0.995, 0.99, 0.967),
+                                  V3 = c(0.592, 0.643, 0.671, 0.696, 0.726, 0.575,
+                                         0.608, 0.636, 0.664, 0.696, 0.726, 0.758,
+                                         0.572, 0.604, 0.632, 0.664, 0.696, 0.728,
+                                         0.758, 0.568, 0.6, 0.632, 0.664, 0.692,
+                                         0.724, 0.758, 0.564, 0.596, 0.628, 0.66,
+                                         0.692, 0.726, 0.758, 0.56, 0.592, 0.624,
+                                         0.656, 0.692, 0.726, 0.758, 0.556, 0.588,
+                                         0.62, 0.656, 0.688, 0.722, 0.758, 0.532,
+                                         0.568, 0.604, 0.64, 0.676, 0.714, 0.754,
+                                         0.518, 0.552, 0.592, 0.632, 0.672, 0.71,
+                                         0.75, 0.504, 0.546, 0.584, 0.624, 0.664,
+                                         0.71, 0.75, 0.495, 0.536, 0.576, 0.62,
+                                         0.66, 0.702, 0.742, 0.495, 0.536, 0.572,
+                                         0.612, 0.652, 0.692, 0.728, 0.503, 0.536,
+                                         0.572, 0.608, 0.64, 0.676, 0.714, 0.52,
+                                         0.554, 0.584, 0.616, 0.652, 0.684, 0.544,
+                                         0.572, 0.604, 0.636, NA, 0.208, 0.157,
+                                         0.129, 0.104, 0.074, 0.225, 0.192, 0.164,
+                                         0.136, 0.104, 0.074, 0.042, 0.228, 0.196,
+                                         0.168, 0.136, 0.104, 0.072, 0.042, 0.232,
+                                         0.2, 0.168, 0.136, 0.108, 0.076, 0.042,
+                                         0.236, 0.204, 0.172, 0.14, 0.108, 0.074,
+                                         0.042, 0.24, 0.208, 0.176, 0.144, 0.108,
+                                         0.074, 0.042, 0.244, 0.212, 0.18, 0.144,
+                                         0.112, 0.078, 0.042, 0.268, 0.232, 0.196,
+                                         0.16, 0.124, 0.086, 0.046, 0.282, 0.248,
+                                         0.208, 0.168, 0.128, 0.09, 0.05, 0.296,
+                                         0.254, 0.216, 0.176, 0.136, 0.09, 0.05,
+                                         0.305, 0.264, 0.224, 0.18, 0.14, 0.098,
+                                         0.058, 0.305, 0.264, 0.228, 0.188, 0.148,
+                                         0.108, 0.072, 0.297, 0.264, 0.228, 0.192,
+                                         0.16, 0.124, 0.086, 0.28, 0.246, 0.216,
+                                         0.184, 0.148, 0.116, 0.256, 0.228, 0.196,
+                                         0.164),
+                                  V4 = c(0.154, 0.154, 0.154, 0.154, 0.154, 0.227,
+                                         0.227, 0.227, 0.227, 0.227, 0.227, 0.227,
+                                         0.295, 0.295, 0.295, 0.295, 0.295, 0.295,
+                                         0.295, 0.36, 0.36, 0.36, 0.36, 0.36,
+                                         0.36, 0.36, 0.424, 0.424, 0.424, 0.424,
+                                         0.424, 0.424, 0.424, 0.492, 0.492, 0.492,
+                                         0.492, 0.492, 0.492, 0.492, 0.552, 0.552,
+                                         0.552, 0.552, 0.552, 0.552, 0.552, 0.612,
+                                         0.612, 0.612, 0.612, 0.612, 0.612, 0.612,
+                                         0.664, 0.664, 0.664, 0.664, 0.664, 0.664,
+                                         0.664, 0.716, 0.716, 0.716, 0.716, 0.716,
+                                         0.716, 0.716, 0.77, 0.77, 0.77, 0.77,
+                                         0.77, 0.77, 0.77, 0.822, 0.822, 0.822,
+                                         0.822, 0.822, 0.822, 0.822, 0.878, 0.878,
+                                         0.878, 0.878, 0.878, 0.878, 0.878, 0.931,
+                                         0.931, 0.931, 0.931, 0.931, 0.931, 0.967,
+                                         0.99, 0.995, 0.99, NA, 0.154, 0.154,
+                                         0.154, 0.154, 0.154, 0.227, 0.227, 0.227,
+                                         0.227, 0.227, 0.227, 0.227, 0.295, 0.295,
+                                         0.295, 0.295, 0.295, 0.295, 0.295, 0.36,
+                                         0.36, 0.36, 0.36, 0.36, 0.36, 0.36,
+                                         0.424, 0.424, 0.424, 0.424, 0.424, 0.424,
+                                         0.424, 0.492, 0.492, 0.492, 0.492, 0.492,
+                                         0.492, 0.492, 0.552, 0.552, 0.552, 0.552,
+                                         0.552, 0.552, 0.552, 0.612, 0.612, 0.612,
+                                         0.612, 0.612, 0.612, 0.612, 0.664, 0.664,
+                                         0.664, 0.664, 0.664, 0.664, 0.664, 0.716,
+                                         0.716, 0.716, 0.716, 0.716, 0.716, 0.716,
+                                         0.77, 0.77, 0.77, 0.77, 0.77, 0.77, 0.77,
+                                         0.822, 0.822, 0.822, 0.822, 0.822, 0.822,
+                                         0.822, 0.878, 0.878, 0.878, 0.878, 0.878,
+                                         0.878, 0.878, 0.931, 0.931, 0.931, 0.931,
+                                         0.931, 0.931, 0.967, 0.99, 0.995, 0.99),
+                                  V5 = c(0.614, 0.631, 0.664, 0.695, 0.73, 0.592,
+                                         0.616, 0.643, 0.671, 0.696, 0.726, 0.75,
+                                         0.575, 0.608, 0.636, 0.664, 0.696, 0.726,
+                                         0.758, 0.572, 0.604, 0.632, 0.664, 0.696,
+                                         0.728, 0.758, 0.568, 0.6, 0.632, 0.664,
+                                         0.692, 0.724, 0.758, 0.564, 0.596, 0.628,
+                                         0.66, 0.692, 0.726, 0.758, 0.56, 0.592,
+                                         0.624, 0.656, 0.692, 0.726, 0.758, 0.556,
+                                         0.588, 0.62, 0.656, 0.688, 0.722, 0.758,
+                                         0.532, 0.568, 0.604, 0.64, 0.676, 0.714,
+                                         0.754, 0.518, 0.552, 0.592, 0.632, 0.672,
+                                         0.71, 0.75, 0.504, 0.546, 0.584, 0.624,
+                                         0.664, 0.71, 0.75, 0.495, 0.536, 0.576,
+                                         0.62, 0.66, 0.702, 0.742, 0.495, 0.536,
+                                         0.572, 0.612, 0.652, 0.692, 0.728, 0.503,
+                                         0.544, 0.584, 0.62, 0.66, 0.702, 0.52,
+                                         0.584, 0.616, 0.652, NA, 0.186, 0.169,
+                                         0.136, 0.105, 0.07, 0.208, 0.184, 0.157,
+                                         0.129, 0.104, 0.074, 0.05, 0.225, 0.192,
+                                         0.164, 0.136, 0.104, 0.074, 0.042, 0.228,
+                                         0.196, 0.168, 0.136, 0.104, 0.072, 0.042,
+                                         0.232, 0.2, 0.168, 0.136, 0.108, 0.076,
+                                         0.042, 0.236, 0.204, 0.172, 0.14, 0.108,
+                                         0.074, 0.042, 0.24, 0.208, 0.176, 0.144,
+                                         0.108, 0.074, 0.042, 0.244, 0.212, 0.18,
+                                         0.144, 0.112, 0.078, 0.042, 0.268, 0.232,
+                                         0.196, 0.16, 0.124, 0.086, 0.046, 0.282,
+                                         0.248, 0.208, 0.168, 0.128, 0.09, 0.05,
+                                         0.296, 0.254, 0.216, 0.176, 0.136, 0.09,
+                                         0.05, 0.305, 0.264, 0.224, 0.18, 0.14,
+                                         0.098, 0.058, 0.305, 0.264, 0.228, 0.188,
+                                         0.148, 0.108, 0.072, 0.297, 0.256, 0.216,
+                                         0.18, 0.14, 0.098, 0.28, 0.216, 0.184,
+                                         0.148),
+                                  V6 = c(0.11, 0.091, 0.079, 0.078, 0.09, 0.154,
+                                         0.154, 0.154, 0.154, 0.154, 0.154, 0.154,
+                                         0.227, 0.227, 0.227, 0.227, 0.227, 0.227,
+                                         0.227, 0.295, 0.295, 0.295, 0.295, 0.295,
+                                         0.295, 0.295, 0.36, 0.36, 0.36, 0.36,
+                                         0.36, 0.36, 0.36, 0.424, 0.424, 0.424,
+                                         0.424, 0.424, 0.424, 0.424, 0.492, 0.492,
+                                         0.492, 0.492, 0.492, 0.492, 0.492, 0.552,
+                                         0.552, 0.552, 0.552, 0.552, 0.552, 0.552,
+                                         0.612, 0.612, 0.612, 0.612, 0.612, 0.612,
+                                         0.612, 0.664, 0.664, 0.664, 0.664, 0.664,
+                                         0.664, 0.664, 0.716, 0.716, 0.716, 0.716,
+                                         0.716, 0.716, 0.716, 0.77, 0.77, 0.77,
+                                         0.77, 0.77, 0.77, 0.77, 0.822, 0.822,
+                                         0.822, 0.822, 0.822, 0.822, 0.822, 0.878,
+                                         0.878, 0.878, 0.878, 0.878, 0.878, 0.931,
+                                         0.931, 0.931, 0.931, NA, 0.11, 0.091,
+                                         0.079, 0.078, 0.09, 0.154, 0.154, 0.154,
+                                         0.154, 0.154, 0.154, 0.154, 0.227, 0.227,
+                                         0.227, 0.227, 0.227, 0.227, 0.227, 0.295,
+                                         0.295, 0.295, 0.295, 0.295, 0.295, 0.295,
+                                         0.36, 0.36, 0.36, 0.36, 0.36, 0.36, 0.36,
+                                         0.424, 0.424, 0.424, 0.424, 0.424, 0.424,
+                                         0.424, 0.492, 0.492, 0.492, 0.492, 0.492,
+                                         0.492, 0.492, 0.552, 0.552, 0.552, 0.552,
+                                         0.552, 0.552, 0.552, 0.612, 0.612, 0.612,
+                                         0.612, 0.612, 0.612, 0.612, 0.664, 0.664,
+                                         0.664, 0.664, 0.664, 0.664, 0.664, 0.716,
+                                         0.716, 0.716, 0.716, 0.716, 0.716, 0.716,
+                                         0.77, 0.77, 0.77, 0.77, 0.77, 0.77, 0.77,
+                                         0.822, 0.822, 0.822, 0.822, 0.822, 0.822,
+                                         0.822, 0.878, 0.878, 0.878, 0.878, 0.878,
+                                         0.878, 0.931, 0.931, 0.931, 0.931),
+                                  V7 = c(0.631, 0.664, 0.696, 0.73, 0.76, 0.616,
+                                         0.643, 0.671, 0.696, 0.726, 0.75, 0.778,
+                                         0.608, 0.636, 0.664, 0.696, 0.726, 0.758,
+                                         0.786, 0.604, 0.632, 0.664, 0.696, 0.728,
+                                         0.758, 0.788, 0.6, 0.632, 0.664, 0.692,
+                                         0.724, 0.758, 0.79, 0.596, 0.628, 0.66,
+                                         0.692, 0.726, 0.758, 0.79, 0.592, 0.624,
+                                         0.656, 0.692, 0.726, 0.758, 0.79, 0.588,
+                                         0.62, 0.656, 0.688, 0.722, 0.758, 0.79,
+                                         0.568, 0.604, 0.64, 0.676, 0.714, 0.754,
+                                         0.79, 0.552, 0.592, 0.632, 0.672, 0.71,
+                                         0.75, 0.79, 0.546, 0.584, 0.624, 0.664,
+                                         0.71, 0.75, 0.79, 0.536, 0.576, 0.62,
+                                         0.66, 0.702, 0.742, 0.782, 0.536, 0.572,
+                                         0.612, 0.652, 0.692, 0.728, 0.77, 0.544,
+                                         0.584, 0.62, 0.66, 0.702, 0.744, 0.584,
+                                         0.616, 0.652, 0.708, NA, 0.169, 0.136,
+                                         0.104, 0.07, 0.04, 0.184, 0.157, 0.129,
+                                         0.104, 0.074, 0.05, 0.022, 0.192, 0.164,
+                                         0.136, 0.104, 0.074, 0.042, 0.014, 0.196,
+                                         0.168, 0.136, 0.104, 0.072, 0.042, 0.012,
+                                         0.2, 0.168, 0.136, 0.108, 0.076, 0.042,
+                                         0.01, 0.204, 0.172, 0.14, 0.108, 0.074,
+                                         0.042, 0.01, 0.208, 0.176, 0.144, 0.108,
+                                         0.074, 0.042, 0.01, 0.212, 0.18, 0.144,
+                                         0.112, 0.078, 0.042, 0.01, 0.232, 0.196,
+                                         0.16, 0.124, 0.086, 0.046, 0.01, 0.248,
+                                         0.208, 0.168, 0.128, 0.09, 0.05, 0.01,
+                                         0.254, 0.216, 0.176, 0.136, 0.09, 0.05,
+                                         0.01, 0.264, 0.224, 0.18, 0.14, 0.098,
+                                         0.058, 0.018, 0.264, 0.228, 0.188, 0.148,
+                                         0.108, 0.072, 0.03, 0.256, 0.216, 0.18,
+                                         0.14, 0.098, 0.056, 0.216, 0.184, 0.148,
+                                         0.092),
+                                  V8 = c(0.091, 0.079, 0.078, 0.09, 0.116, 0.154,
+                                         0.154, 0.154, 0.154, 0.154, 0.154, 0.154,
+                                         0.227, 0.227, 0.227, 0.227, 0.227, 0.227,
+                                         0.227, 0.295, 0.295, 0.295, 0.295, 0.295,
+                                         0.295, 0.295, 0.36, 0.36, 0.36, 0.36,
+                                         0.36, 0.36, 0.36, 0.424, 0.424, 0.424,
+                                         0.424, 0.424, 0.424, 0.424, 0.492, 0.492,
+                                         0.492, 0.492, 0.492, 0.492, 0.492, 0.552,
+                                         0.552, 0.552, 0.552, 0.552, 0.552, 0.552,
+                                         0.612, 0.612, 0.612, 0.612, 0.612, 0.612,
+                                         0.612, 0.664, 0.664, 0.664, 0.664, 0.664,
+                                         0.664, 0.664, 0.716, 0.716, 0.716, 0.716,
+                                         0.716, 0.716, 0.716, 0.77, 0.77, 0.77,
+                                         0.77, 0.77, 0.77, 0.77, 0.822, 0.822,
+                                         0.822, 0.822, 0.822, 0.822, 0.822, 0.878,
+                                         0.878, 0.878, 0.878, 0.878, 0.878, 0.931,
+                                         0.931, 0.931, 0.931, NA, 0.091, 0.079,
+                                         0.078, 0.09, 0.116, 0.154, 0.154, 0.154,
+                                         0.154, 0.154, 0.154, 0.154, 0.227, 0.227,
+                                         0.227, 0.227, 0.227, 0.227, 0.227, 0.295,
+                                         0.295, 0.295, 0.295, 0.295, 0.295, 0.295,
+                                         0.36, 0.36, 0.36, 0.36, 0.36, 0.36, 0.36,
+                                         0.424, 0.424, 0.424, 0.424, 0.424, 0.424,
+                                         0.424, 0.492, 0.492, 0.492, 0.492, 0.492,
+                                         0.492, 0.492, 0.552, 0.552, 0.552, 0.552,
+                                         0.552, 0.552, 0.552, 0.612, 0.612, 0.612,
+                                         0.612, 0.612, 0.612, 0.612, 0.664, 0.664,
+                                         0.664, 0.664, 0.664, 0.664, 0.664, 0.716,
+                                         0.716, 0.716, 0.716, 0.716, 0.716, 0.716,
+                                         0.77, 0.77, 0.77, 0.77, 0.77, 0.77, 0.77,
+                                         0.822, 0.822, 0.822, 0.822, 0.822, 0.822,
+                                         0.822, 0.878, 0.878, 0.878, 0.878, 0.878,
+                                         0.878, 0.931, 0.931, 0.931, 0.931))
+  return(pedar_insole_grid)
+}
