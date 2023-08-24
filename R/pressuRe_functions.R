@@ -1,16 +1,16 @@
 # to do (current version)
 # pliance if sensors matrix then add max_matrix
-# Do we have all pedar insoles? Double check areas
-# add more input tests to throw errors
 # fscan processing needs to be checked (work with NA?)
 # in edit_mask, make edit_list a vector that works with numbers or names?
 # change pedar_polygon to sensel_polygon
-
+# create mask manual work with internal hole
+# make capture frequency a vector to allow for uneven sampling
 
 # to do (future)
 # global pressure_import function (leave for V2)
 # create masks for iscan during startup
 # CPEI manual edit to be built into function
+# add more input tests to throw errors
 # cop for pedar
 # UNITS!!!
 
@@ -107,17 +107,8 @@ load_emed <- function(pressure_filepath) {
       str <- (nfs * i) - nfs + j
 
       # load as table
-      y <- pressure_raw[(breaks[str] + 10):(ends[which(ends > breaks[str])[1]] - 2)]
-      num_col <- unlist(str_split(y[1], "\\s+"))
-      wids <- rep(8, times = length(num_col))
-      if (nfs > 1) {
-        z <- read.fwf(textConnection(y), widths = wids)
-      } else {
-        z <- read.table(textConnection(y), sep = "\t")
-      }
-
-      colnames(z) <- unname(z[1, ])
-      z <- z[2:nrow(z), ]
+      y <- pressure_raw[(breaks[str] + 10):(ends[which(ends > breaks[str])[1]] - 1)]
+      z <- read.table(textConnection(y), sep = "", header = TRUE)
 
       # remove zeros
       z[is.na(z)] <- 0
@@ -126,18 +117,14 @@ load_emed <- function(pressure_filepath) {
       if (colnames(z)[ncol(z)] == "Force") {z <- z[, 1:(ncol(z) - 1)]}
 
       # remove force row
-      if (z[nrow(z), 1] == "Force") {z <- z[1:(nrow(z) - 1),]}
+      if (rownames(z)[nrow(z)] == "Force") {z <- z[1:(nrow(z) - 1),]}
 
-      # column numbers
-      cn <- as.numeric(colnames(z)[2:length(z)])
-
-      # row numbers
-      rn <- unname(unlist((z[, 1])))
-      z <- as.matrix(z[, 2:ncol(z)])
-      z <- matrix(as.numeric(z), ncol = ncol(z))
+      # column and row numbers
+      cn <- as.numeric(gsub("\\D", "", colnames(z)))
+      rn <- as.numeric(gsub("\\D", "", rownames(z)))
 
       # add to array
-      pressure_array[rn, cn, i] <- z
+      pressure_array[rn, cn, i] <- as.matrix(z)
     }
   }
 
@@ -271,6 +258,7 @@ load_pedar <- function(pressure_filepath) {
 #' pliance_data <- system.file("extdata", "pliance_test.asc", package = "pressuRe")
 #' pressure_data <- load_pliance(pliance_data)
 #' @importFrom stringr str_split str_trim
+#' @importFrom sf st_centroid
 #' @export
 
 load_pliance <- function(pressure_filepath) {
@@ -282,6 +270,9 @@ load_pliance <- function(pressure_filepath) {
   ## extension is correct
   if (str_split(basename(pressure_filepath), "\\.")[[1]][2] != "asc")
     stop("incorrect file extension, expected .asc")
+
+  # global variables
+  id <- NULL
 
   # Read unformatted emed data
   pressure_raw <- readLines(pressure_filepath, warn = FALSE)
@@ -297,28 +288,62 @@ load_pliance <- function(pressure_filepath) {
   ## remove MVP and MPP lines if present
   y <- y[-(which(str_detect(y, "MVP")))]
   y <- y[-(which(str_detect(y, "MPP")))]
-  pressure_array <- as.matrix(read.table(textConnection(y), sep = ""))
-  pressure_array <- pressure_array[, 2:ncol(pressure_array)]
+  pressure_array_full <- as.matrix(read.table(textConnection(y), sep = ""))
+  pressure_array_full <- pressure_array_full[, 2:ncol(pressure_array_full)]
+  active_sensors <- which(colSums(pressure_array_full) > 0)
+  pressure_array <- pressure_array_full[, active_sensors]
 
   # sensor coords
   sensor_array_line <- which(grepl("corner", pressure_raw, useBytes = TRUE))[1]
   sensor_array <- pressure_raw[(sensor_array_line + 1):(sensor_array_line + 8)]
   sensor_array <- read.table(textConnection(sensor_array), sep = "")
   sensor_array <- t(sensor_array[, 2:ncol(sensor_array)]) / 100
-  sens_array <- sensor_2_polygon2(sensor_array)
+  sens_array_full <- sensor_2_polygon2(sensor_array)
+  sens_array <- sens_array_full %>% filter(id %in% active_sensors)
 
   # sensor areas
   sens_areas <- sensor_area(sens_array)
 
   # if sensors are all same size and rectilinear, make max matrix
-  if (unique(sens_areas == 1)) {
+  if (length(unique(signif(sens_areas, 6))) == 1) {
+    # make grid based on sensor sizes
+    x_max <- max(sens_array_full$x)
+    x_min <- min(sens_array_full$x)
+    y_max <- max(sens_array_full$y)
+    y_min <- min(sens_array_full$y)
+    sens_1 <- sens_array_full %>% filter(id == 1)
+    base_x <- max(sens_1$x) - min(sens_1$x)
+    base_y <- max(sens_1$y) - min(sens_1$y)
+    n_rows <- round(y_max / base_y)
+    n_cols <- round(x_max / base_x)
 
-  }
+    # sensor centroids
+    sens_poly <- sens_df_2_polygon(sens_array_full)
+    centroids <- data.frame(x = double(), y = double())
+    for (sens in 1:length(sens_poly)) {
+      centroids[sens, ] <- st_coordinates(st_centroid(sens_poly[[sens]]))
+    }
+
+    # find which grid square each sensor falls in and map to matrix
+    pressure_max <- apply(pressure_array_full, 2, max)
+    max_mat <- matrix(NA, nrow = n_rows, ncol = n_cols)
+    for (i in 1:nrow(centroids)) {
+      # col
+      mat_col <- ceiling((centroids[i, 1] / x_max) * n_cols)
+
+      # row
+      mat_row <- (n_rows + 1) - ceiling((centroids[i, 2] / y_max) * n_rows)
+
+      # map to matrix
+      max_mat[mat_row, mat_col] <- pressure_max[i]
+    }
+  } else {max_mat <- NA}
 
   # return
   return(list(pressure_array = pressure_array, pressure_system = "pliance",
               sens_size = sens_areas, time = time, masks = NULL,
-              events = NULL, sensor_polygons = sens_array, max_matrix = NA))
+              events = NULL, sensor_polygons = sens_array,
+              max_matrix = max_mat))
 }
 
 
@@ -514,6 +539,123 @@ load_footscan <- function(pressure_filepath) {
 
 # =============================================================================
 
+#' @title Load xsensor data
+#' @description Imports and formats files collected on xsensor insole systems
+#' @param pressure_filepath String. Filepath pointing to emed pressure file
+#' @return A list with information about the pressure data.
+#' \itemize{
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            row dimension represents time
+#'   \item pressure_system. String defining pressure system
+#'   \item sens_size. Numeric vector with the dimensions of the sensors
+#'   \item time. Numeric value for time between measurements
+#'   \item masks. List
+#'   \item events. List
+#'   \item sensor_polygons. Data frame with corners of sensors
+#'   \item max_matrix. Matrix
+#'  }
+#'  @examples
+#' xsensor_data <- system.file("extdata", "xsensor_data.csv", package = "pressuRe")
+#' pressure_data <- load_xsensor(xsensor_data)
+#'  @importFrom abind abind
+#'  @export
+load_xsensor <- function(pressure_filepath) {
+  # check parameters
+  ## file exists
+  if (file.exists(pressure_filepath) == FALSE)
+    stop("file does not exist")
+
+  ## extension is correct
+  if (str_split(basename(pressure_filepath), "\\.")[[1]][2] != "csv")
+    stop("incorrect file extension, expected .csv")
+
+  # Read unformatted emed data
+  pressure_raw <- readLines(pressure_filepath, warn = FALSE)
+
+  # get sensor size
+  sens_w_ln <- which(grepl("Sensel Width", pressure_raw, useBytes = TRUE))[1]
+  sens_h_ln <- which(grepl("Sensel Height", pressure_raw, useBytes = TRUE))[1]
+  sens_w <- str_extract_all(pressure_raw[sens_w_ln], "\\d+\\.\\d+")
+  sens_w <- as.numeric(unlist(sens_w))
+  sens_h <- str_extract_all(pressure_raw[sens_h_ln], "\\d+\\.\\d+")
+  sens_h <- as.numeric(unlist(sens_h))
+  sens_size <- sens_w * sens_h
+  if (str_detect(pressure_raw[sens_w_ln], "cm") == TRUE) {
+    sens_size <- sens_size * 0.0001
+  }
+
+  # get capture frequency
+  time_ln <- which(grepl("^Time,", pressure_raw, useBytes = TRUE))[c(10, 11)]
+  time_1 <- str_split(pressure_raw[time_ln[1]], ",")[[1]][2]
+  time_1 <- as.POSIXct(time_1, format = "%H:%M:%OS")
+  time_2 <- str_split(pressure_raw[time_ln[2]], ",")[[1]][2]
+  time_2 <- as.POSIXct(time_2, format = "%H:%M:%OS")
+  time <- as.numeric(difftime(time_2, time_1))
+
+  # right foot
+  ## determine position breaks
+  breaks <- str_which(pressure_raw, "FRAME")
+  rf <- str_which(pressure_raw, "RF")
+  lf <- str_which(pressure_raw, "LF")
+  sensels <- str_which(pressure_raw, "SENSELS")
+
+  ## matrix size
+  n_row <- which(grepl("Rows", pressure_raw))[1]
+  n_row <- as.numeric(unlist(str_extract_all(pressure_raw[n_row], "\\d+")))
+  n_col <- which(grepl("Columns", pressure_raw))[1]
+  n_col <- as.numeric(unlist(str_extract_all(pressure_raw[n_col], "\\d+")))
+
+  ## get frames
+  pressure_array_r <- array(0, dim = c(n_row, n_col, length(breaks)))
+  pressure_array_l <- pressure_array_r
+
+  for (frm in seq_along(breaks)) {
+    # right
+    rf_ln <- rf[which(rf > breaks[frm])][1]
+    sensel_ln <- sensels[which(sensels > rf_ln)][1]
+    y <- pressure_raw[(sensel_ln + 2):(sensel_ln + 2 + (n_row * 2))]
+    y <- y[seq(1, (n_row * 2), 2)]
+    z <- read.table(textConnection(y), sep = ",")[, 1:n_col]
+    pressure_array_r[,, frm] <- as.matrix(z)
+
+    # left
+    lf_ln <- lf[which(lf > breaks[frm])][1]
+    sensel_ln <- sensels[which(sensels > lf_ln)][1]
+    y <- pressure_raw[(sensel_ln + 2):(sensel_ln + 2 + (n_row * 2))]
+    y <- y[seq(1, (n_row * 2), 2)]
+    z <- read.table(textConnection(y), sep = ",")[, 1:n_col]
+    pressure_array_l[,, frm] <- as.matrix(z)
+  }
+
+  # join left and right (separate by 2 empty cols)
+  empty <- array(0, c(n_row, 2, length(breaks)))
+  pressure_array <- abind::abind(pressure_array_l, empty, pressure_array_r, along = 2)
+
+  # make max mat
+  max_mat <- apply(simplify2array(pressure_array), 1:2, max)
+
+  # active sensor polygons
+  active_sensors <- which(max_mat > 0, arr.ind = TRUE)
+  sens_array <- sensor_2_polygon3(max_mat, sens_w, sens_h)
+
+  # active sensor areas
+  sens_areas <- sensor_area(sens_array)
+
+  # array to 2d matrix
+  full_mat <- matrix(NA, nrow = dim(pressure_array)[3], ncol = nrow(active_sensors))
+  for (i in 1:dim(pressure_array)[3]) {
+    full_mat[i, ] <- pressure_array[, , i][active_sensors]
+  }
+
+  # return formatted xsensor data
+  return(list(pressure_array = full_mat, pressure_system = "xsensor",
+              sens_size = sens_areas, time = time, masks = NULL, events = NULL,
+              sens_polygons = sens_array, max_matrix = max_mat))
+}
+
+
+# =============================================================================
+
 #' @title Interpolate pressure data
 #' @description Resamples pressure data over time. Useful for normalizing to
 #' stance phase, for example
@@ -620,8 +762,7 @@ select_steps <- function (pressure_data, threshold = "auto", min_frames = 10,
 
   # get force df
   if (pressure_data[[2]] == "pedar") {
-    R <- "RIGHT"
-    te_R <- threshold_event(pressure_data, threshold[1], min_frames, R)
+    te_R <- threshold_event(pressure_data, threshold[1], min_frames, "RIGHT")
     te_L <- threshold_event(pressure_data, threshold[length(threshold)],
                             min_frames, "LEFT")
     df_R <- te_R[[1]]
@@ -676,7 +817,8 @@ select_steps <- function (pressure_data, threshold = "auto", min_frames = 10,
 
 auto_detect_side <- function(pressure_data) {
   # throw error if pedar data
-  if (!(pressure_data[[2]] == "emed" | pressure_data[[2]] == "footscan"))
+  if (!(pressure_data[[2]] == "emed" | pressure_data[[2]] == "footscan" |
+        pressure_data[[2]] == "pliance"))
     stop("This function currently only works for pressure plate data")
 
   # Bounding box
@@ -880,7 +1022,8 @@ cop <- function(pressure_data) {
 #'   measurement. z dimension represents time
 #' @param variable String. "max" = maximum value of each sensor across full
 #' dataset. "mean" = average value of sensors over full dataset."frame" = an
-#' individual pressure frame
+#' individual pressure frame. "meanmax" average max values across cycles (
+#' currently just for pedar)
 #' @param frame Integer. Only used if variable = "frame".
 #' @param plot Logical. Display pressure image
 #' @return Matrix. Maximum or mean values for all sensors
@@ -895,7 +1038,8 @@ footprint <- function(pressure_data, variable = "max", frame = NULL,
   # check input
   if (is.array(pressure_data[[1]]) == FALSE)
     stop("pressure_frames input must contain an array")
-  stopifnot("Unknown Variable" = variable %in% c("max", "mean", "frame"))
+  stopifnot("Unknown Variable" = variable %in% c("max", "mean", "frame",
+                                                 "meanmax"))
   if (variable == "frame" & missing(frame))
     stop("For a single frame, a value is needed for frame variable")
 
@@ -911,6 +1055,37 @@ footprint <- function(pressure_data, variable = "max", frame = NULL,
       mat <- pressure_data[[1]][frame, ]
     } else {
       stop("The frame selected is greater that the number of frames in trial")
+    }
+  }
+  if (variable == "meanmax") {
+    if (is.data.frame(pressure_data[[6]]) == FALSE) {
+      stop("data must have events defined")
+    } else {
+      if (pressure_data[[2]] == "pedar") {
+        evs <- pressure_data[[6]]
+        ev_rows_r <- which(evs[, 1] == "RIGHT")
+        ev_rows_l <- which(evs[, 1] == "LEFT")
+        mat_peak_r <- matrix(NA, nrow = length(ev_rows_r), ncol = 99)
+        mat_peak_l <- matrix(NA, nrow = length(ev_rows_l), ncol = 99)
+
+        # right
+        for (i in 1:length(ev_rows_r)) {
+          start_frame <- evs[ev_rows_r[i], 2]
+          end_frame <- evs[ev_rows_r[i], 3]
+          pd <- pressure_data[[1]][start_frame:end_frame, 100:198]
+          mat_peak_r[i, ] <- apply(pd, 2, "max")
+        }
+        mean_peak_r <- apply(mat_peak_r, 2, "mean")
+        # left
+        for (i in 1:length(ev_rows_l)) {
+          start_frame <- evs[ev_rows_l[i], 2]
+          end_frame <- evs[ev_rows_l[i], 3]
+          pd <- pressure_data[[1]][start_frame:end_frame, 1:99]
+          mat_peak_l[i, ] <- apply(pd, 2, "max")
+        }
+        mean_peak_l <- apply(mat_peak_l, 2, "mean")
+        mat <- c(mean_peak_l, mean_peak_r)
+      }
     }
   }
 
@@ -932,7 +1107,9 @@ footprint <- function(pressure_data, variable = "max", frame = NULL,
 #' average value of sensors over time (usually for static analyses). "frame" =
 #' an individual frame
 #' @param frame Integer.
-#' @param step_n If numeric, the step number to plot (only for insole data).
+#' @param step_n If numeric, the step number to plot (only for insole data). If
+#' "max", the max across complete trial, if "meanmax", the max on a per step
+#' basis
 #' @param smooth Logical. Not implemented. If TRUE, plot will interpolate
 #'   between sensors to increase data density
 #' @param plot_COP Logical. If TRUE, overlay COP data on plot. Default = FALSE
@@ -973,6 +1150,7 @@ plot_pressure <- function(pressure_data, variable = "max", smooth = FALSE, frame
   # if pedar
   if (pressure_data[[2]] == "pedar") {
     if (step_n == "max") {pedar_var <- "max"; step_no <- NA}
+    if (step_n == "meanmax") {pedar_var <- "meanmax"; step_no <- NA}
     if (is.numeric(step_n)) {pedar_var <- "step_max"; step_no <- step_n}
     cor <- plot_pedar(pressure_data, pedar_var, step_no, foot_side = "both")
     x_lims <- c(0, max(cor$x))
@@ -986,12 +1164,8 @@ plot_pressure <- function(pressure_data, variable = "max", smooth = FALSE, frame
     # footprint
     fp <- footprint(pressure_data, variable = variable, frame)
 
-    # get footprint vector
-    #fp <- as.vector(fp)
-    #fp <- fp[fp > 0]
-
     # combine with pressure values
-    ids <- c(1:length(fp))
+    ids <- unique(pressure_data[[7]]$id)#c(1:length(fp))
     vals <- data.frame(id = ids, value = fp)
 
     # merge value and coordinate frames
@@ -1210,8 +1384,8 @@ create_mask_manual <- function(pressure_data, mask_definition = "by_vertices", n
   } else {
     grDevices::x11()
     g <- plot_pressure(pressure_data, plot = FALSE)
-    g <- g + scale_x_continuous(expand = c(0, 0), limits = c(-0.01, 0.15))
-    g <- g + scale_y_continuous(expand = c(0, 0), limits = c(-0.01, 0.30))
+    #g <- g + scale_x_continuous(expand = c(0, 0), limits = c(-0.01, 0.15))
+    #g <- g + scale_y_continuous(expand = c(0, 0), limits = c(-0.01, 0.30))
     print(g)
   }
 
@@ -1259,6 +1433,10 @@ create_mask_manual <- function(pressure_data, mask_definition = "by_vertices", n
 
   # define mask by selecting sensors
   if (mask_definition == "by_sensors") {
+    # check just one mask
+    if (n_masks != 1)
+      stop("only one mask can be created when using by_sensors")
+
     # selection of sensors
     message(paste0("Select ", n_sens, " adjacent sensors to define your custom mask"))
     sensor_pts <- gglocator(n_sens)
@@ -1358,7 +1536,7 @@ create_mask_auto <- function(pressure_data, masking_scheme, foot_side = "auto",
 
   ## full
   if (masking_scheme == "automask_novel") {
-    if (pressure_data[[2]] != "emed")
+    if (!(pressure_data[[2]] == "emed" || pressure_data[[2]] == "pliance"))
       stop("automask is not compatible with this type of data")
     pressure_data <- automask(pressure_data, "automask_novel", plot = FALSE)
   }
@@ -1722,82 +1900,6 @@ cpei <- function(pressure_data, foot_side, plot_result = TRUE) {
 
 # =============================================================================
 
-#' @title Dynamic Plantar Loading Index
-#' @description Determine Dynamic plantar loading index (DPLI) for
-#' footprint pressure data
-#' @param pressure_data List. First item is a 3D array covering each timepoint
-#' of the measurement.
-#' @param n_bins Numeric. Number of bins used to calculate DPLI
-#' @returns Data frame. Contains DPLI for each step
-#' @examples
-#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
-#' pressure_data <- load_emed(emed_data)
-#' dpli(pressure_data, 10)
-#' @importFrom graphics hist
-#' @importFrom stats dnorm lm sd
-#' @export
-
-dpli <- function(pressure_data, n_bins) {
-  if (length(pressure_data[[6]]) == 0) {
-    n_step = 1
-  } else {
-    n_step = nrow(pressure_data[[6]])
-  }
-
-  # df to store result
-  dpli <- data.frame(step = c(1:n_step),
-                     dpli = rep(NA, length.out = n_step))
-
-  # get loading index for each step
-  for (step in 1:n_step) {
-    # get step data
-    if (n_step == 1) {
-      pressure_array <- pressure_data[[1]]
-    } else {
-      step_str <- unname(unlist(pressure_data[[6]][step, 2]))
-      step_end <- unname(unlist(pressure_data[[6]][step, 3]))
-      pressure_array <- pressure_data[[1]][c(step_str:step_end), ]
-    }
-
-    # check for step side (pedar)
-    if (pressure_data[[2]] == "pedar") {
-      if (pressure_data[[6]][step, 1] == "RIGHT") {
-        pressure_array[, 1:99] <- 0
-      } else {pressure_array[, 100:198] <- 0}
-    }
-
-    # get peak pressure vector
-    press_vec <- rep(NA, length.out = nrow(pressure_array))
-    for (i in 1:nrow(pressure_array)) {
-      press_vec[i] <- max(pressure_array[i, ])
-    }
-
-    # interpolate to 101
-    press_vec <- approxP(press_vec, 101)
-
-    # bin data
-    binned <- hist(press_vec, breaks = seq(from = min(press_vec),
-                                           to = max(press_vec),
-                                           length.out = n_bins + 1),
-                   plot = FALSE)
-
-    # get distribution
-    sd_press <- sd(press_vec)
-    mean_press <- mean(press_vec)
-    norm_dist <- dnorm(binned$mids, mean_press, sd_press)
-    norm_dist <- norm_dist * (max(binned$counts) / max(norm_dist))
-
-    # get r^2
-    dpli[step, 2] <- summary(lm(binned$counts ~ norm_dist))$adj.r.squared
-  }
-
-  # return
-  return(dpli)
-}
-
-
-# =============================================================================
-
 #' Analyze masked regions of pressure data
 #' @param pressure_data List. Includes a 3D array covering each timepoint of the
 #'   measurement. z dimension represents time
@@ -1807,7 +1909,8 @@ dpli <- function(pressure_data, n_bins) {
 #'   proportion of the sensor that falls within the mask border
 #' @param variable String. Variable to be determined. "press_peak_sensor",
 #' "press_peak_mask", "contact_area_peak", "pti_1", "pti_2",
-#' "force_time_integral", "force_peak"
+#' "force_time_integral", "force_peak", "dpli", "press_peak_sensor_ts", "force_ts".
+#' Variables ending in "_ts" produce time series data
 #' @param pressure_units String. Default "kPa". Other options: "MPa", "Ncm2"
 #' (Newtons per square centimeter)
 #' @param area_units String. Default is "cm2" (square centimeters). Other
@@ -1818,7 +1921,7 @@ dpli <- function(pressure_data, n_bins) {
 #' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
 #' pressure_data <- load_emed(emed_data)
 #' pressure_data <- create_mask_auto(pressure_data, "automask_simple", plot = FALSE)
-#' mask_analysis(pressure_data, FALSE, variable = "press_peak_sensor")
+#' mask_analysis(pressure_data, FALSE, variable = "press_peak_sensor_ts")
 #' @importFrom sf st_intersects st_geometry st_area
 #' @importFrom pracma trapz
 #' @export
@@ -1837,22 +1940,23 @@ mask_analysis <- function(pressure_data, partial_sensors = FALSE,
   events <- pressure_data[[6]]
 
   # set up mask/sensor areas
-  ## sensor area
-  if (pressure_data[[2]] != "pedar") {
-    # Make active sensors into polygons
-    sens_poly <- sens_df_2_polygon(pressure_data[[7]])
+  ## Make active sensors into polygons
+  sens_poly <- sens_df_2_polygon(pressure_data[[7]])
 
-    ## For each region mask, find which polygons intersect
-    sens_mask_df <- matrix(rep(0, length.out = (length(sens_poly) * length(masks))),
-                           nrow = length(sens_poly), ncol = length(masks))
-    sens_mask_df <- as.data.frame(sens_mask_df)
-    colnames(sens_mask_df) <- names(masks)
-    for (i in 1:length(masks)){
-      for (j in 1:length(sens_poly)) {
-        x <- st_intersects(masks[[i]], sens_poly[[j]])
-        if (identical(x[[1]], integer(0)) == FALSE) {
-          y <- st_intersection(masks[[i]], sens_poly[[j]])
-          sens_mask_df[j, i] <- st_area(y) / pressure_data[[3]][j]
+  ## For each region mask, find which polygons intersect
+  sens_mask_df <- matrix(rep(0, length.out = (length(sens_poly) * length(masks))),
+                         nrow = length(sens_poly), ncol = length(masks))
+  sens_mask_df <- as.data.frame(sens_mask_df)
+  colnames(sens_mask_df) <- names(masks)
+  for (mask in 1:length(masks)){
+    for (j in 1:length(sens_poly)) {
+      x <- st_intersects(masks[[mask]], sens_poly[[j]])
+      if (identical(x[[1]], integer(0)) == FALSE) {
+        y <- st_intersection(masks[[mask]], sens_poly[[j]])
+        if (pressure_data[[2]] == "pedar") {
+          sens_mask_df[j, mask] <- st_area(y) / st_area(sens_poly[[j]])
+        } else {
+          sens_mask_df[j, mask] <- st_area(y) / pressure_data[[3]][j]
         }
       }
     }
@@ -1867,24 +1971,6 @@ mask_analysis <- function(pressure_data, partial_sensors = FALSE,
         mask_sides[mask] <- "LEFT"
       } else {
         mask_sides[mask] <- "RIGHT"
-      }
-    }
-
-    # Make active sensors into polygons
-    sens_poly <- sens_df_2_polygon(pressure_data[[7]])
-
-    # For each region mask, find which polygons intersect
-    sens_mask_df <- matrix(rep(0, length.out = (length(sens_poly) * length(masks))),
-                           nrow = length(sens_poly), ncol = length(masks))
-    sens_mask_df <- as.data.frame(sens_mask_df)
-    colnames(sens_mask_df) <- names(masks)
-    for (mask in seq_along(masks)){
-      for (j in 1:length(sens_poly)) {
-        x <- st_intersects(masks[[mask]], sens_poly[[j]])
-        if (identical(x[[1]], integer(0)) == FALSE) {
-          y <- st_intersection(masks[[mask]], sens_poly[[j]])
-          sens_mask_df[j, mask] <- st_area(y) / st_area(sens_poly[[j]])
-        }
       }
     }
   }
@@ -1932,10 +2018,20 @@ mask_analysis <- function(pressure_data, partial_sensors = FALSE,
         val <- pressure_peak(pressure_data_, sens_mask_df, mask)
       }
 
+      if (variable == "press_peak_sensor_ts") {
+        pv <- "peak_press_sensor_ts"
+        val <- pressure_peak_ts(pressure_data_, sens_mask_df, mask)
+      }
+
       # Analyse regions for maximum force during the trial
       if (variable == "force_peak") {
         pv <- "peak_force"
         val <- force_peak(pressure_data_, pressure_data, sens_mask_df, mask)
+      }
+
+      if (variable == "force_ts") {
+        pv <- "force_ts"
+        val <- force_ts(pressure_data_, pressure_data, sens_mask_df, mask)
       }
 
       # Analyse regions for peak regional pressure (defined as the pressure
@@ -1969,6 +2065,11 @@ mask_analysis <- function(pressure_data, partial_sensors = FALSE,
         val <- fti(pressure_data_, pressure_data, sens_mask_df, mask)
       }
 
+      if (variable == "dpli") {
+        pv <- "dpli"
+        val <- dpli(pressure_data_, pressure_data, sens_mask_df, mask, 30)
+      }
+
       # pedar adjustments to output df
       if (pressure_data[[2]] == "pedar") {
         if (mask_sides[mask] == events[cycle, 1]) {
@@ -1976,31 +2077,24 @@ mask_analysis <- function(pressure_data, partial_sensors = FALSE,
       }
 
       # add to output df
-      output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+      if (!str_ends(variable, "_ts")) {
+        output_df <- rbind(output_df, c(time, cycle, side, pv, mn, val))
+      } else {
+        ns <- length(val)
+        df <- data.frame(time = seq(0, by = pressure_data[[4]], length.out = ns),
+                         cycle = rep(cycle, ns), side = rep(side, ns),
+                         pressure_variable = rep(pv, ns),
+                         mask_name = rep(mn, ns), value = val)
+        output_df <- rbind(output_df, df)
+      }
     }
   }
 
   # fix col names
   colnames(output_df) <- col_names
   if (pressure_data[[2]] == "pedar") {
-    output_df <- output_df %>% filter(!is.na(side))
+    output_df <- output_df %>% filter(side != "None")
   }
-
-
-  # Analyse regions for maximum value of any sensor for each measurement frame
-  #if (variable == "press_peak_sensor_ts") {
-  #  for (mask in seq_along(masks)) {
-  #    for (i in 1:(dim(pressure_data[[1]])[3])) {
-  #      P <- c(pressure_data[[1]][, , i])
-  #      P <- P[act_sens]
-  #      output_mat[i, mask] <- max(P[which(sens_mask_df[, mask] > 0)])
-  #    }
-  #  }
-  #  if (pressure_units == "MPa") {output_mat <- output_mat * 0.001}
-  #  if (pressure_units == "Ncm2") {output_mat <- output_mat * 0.1}
-  #}
-
-
 
   # Analyse regions for peak mask pressure (defined as the maximum mean pressure
   # of active sensors in region during the trial). Outputs 101 point vector (kPa)
@@ -2034,22 +2128,17 @@ mask_analysis <- function(pressure_data, partial_sensors = FALSE,
     }
   }
 
-  # Analyse regions for force throughout the trial (outputs vector)
-  if (variable == "force_ts") {
-    for (mask in seq_along(masks)) {
-      for (i in 1:(dim(pressure_data[[1]])[3])) {
-        P <- c(pressure_data[[1]][, , i])
-        P <- P[act_sens] * sensor_area * 1000
-        output_mat[i, mask] <- sum(P * sens_mask_df[, mask])
-      }
-    }
-  }
-
   # adjust units
   #if (pressure_units == "MPa") {output_df$value <- output_df$value * 0.001}
   #if (pressure_units == "Ncm2") {output_df$value <- output_df$value * 0.1}
 
   # adjust df
+  output_df$time <- as.numeric(output_df$time)
+  output_df$cycle <- as.integer(output_df$cycle)
+  output_df$side <- as.factor(output_df$side)
+  output_df$pressure_variable <- as.factor(output_df$pressure_variable)
+  output_df$mask_name <- as.factor(output_df$mask_name)
+  output_df$value <- as.numeric(output_df$value)
   if (!str_ends(variable, "_ts")) {output_df <- subset(output_df, select = -c(time))}
   if (pressure_data[[2]] != "pedar") {output_df <- subset(output_df, select = -c(side))}
   if (length(events) == 0) {output_df <- subset(output_df, select = -c(cycle))}
@@ -2523,7 +2612,7 @@ sensor_area <- function(sensor_df) {
   # get areas
   areas <- rep(NA, length(n_sensors))
   for (sens in seq_along(n_sensors)) {
-    sens_mat <- as.matrix(sensor_df %>% filter(id == sens))[, c(1, 2)]
+    sens_mat <- as.matrix(sensor_df %>% filter(id == n_sensors[sens]))[, c(1, 2)]
     areas[sens] <- st_area(st_polygon(list(sens_mat)))
   }
 
@@ -2577,7 +2666,7 @@ force_pedar <- function(pressure_data, variable = "force", min_press = 10) {
 #' @description produces dataframe that plot_pressure uses to plot pedar data
 #' @param pressure_data List.
 #' @param pressure_image String. "max" = maximum values for full trial;
-#' "mean" = mean value across trial; "step_max"; "step_mean"
+#' "mean" = mean value across trial; "step_max"; "step_mean"; "meanmax"
 #' @param foot_side String. "both", "left", or "right"
 #' @param step_n Numeric. If pressure_image is "step_max", the step number to
 #' analyze
@@ -2601,6 +2690,7 @@ plot_pedar <- function(pressure_data, pressure_image = "max",
   if (pressure_image == "max") {
     R_data <- apply(pressure_R_mat, 2, max)
     L_data <- apply(pressure_L_mat, 2, max)
+    comb_data <- c(L_data, R_data)
   }
 
   # separate into steps
@@ -2610,16 +2700,16 @@ plot_pedar <- function(pressure_data, pressure_image = "max",
     pressure_L_mat <- pressure_L_mat[c(events[step_n, 2]:events[step_n, 3]), ]
     R_data <- apply(pressure_R_mat, 2, max)
     L_data <- apply(pressure_L_mat, 2, max)
+    comb_data <- c(L_data, R_data)
   }
 
-  # combine data
-  comb_data <- c(L_data, R_data)
+  # average across steps
+  if (pressure_image == "meanmax") {
+    comb_data <- footprint(pressure_data, "meanmax")
+  }
 
   # make ids
   ids <- 1:198
-  #ids <- c()
-  #for (i in 1:99) {ids = append(ids, paste0("L", i))}
-  #for (i in 1:99) {ids = append(ids, paste0("R", i))}
 
   # make df
   df <- data.frame(id = ids, value = comb_data)
@@ -2769,113 +2859,140 @@ st_line2polygon <- function(mat, distance, direction) {
 #' @description Calculates line proximal to toes
 #' @param pressure_data List. First item should be a 3D array covering each
 #' timepoint of the measurement. z dimension represents time
-#' @importFrom zoo as.zoo rollapply
-#' @importFrom stats na.omit
 #' @importFrom sf st_cast st_join st_sf
+#' @importFrom raster raster adjacent extent ncell
+#' @importFrom gdistance transition geoCorrection shortestPath
+#' @importFrom dplyr distinct group_by mutate n summarize across everything
+#' @importFrom stats var
 #' @noRd
 
-toe_line <- function(pressure_data) {
+toe_line <- function(pressure_data, side) {
   # global variables
-  clusterID <- NULL
+  id <- NULL
 
   # get max footprint and take top half
   pf_max <- pressure_data[[8]]
+
+  # make outside values high
+  ## sensor centroids
+  sens_1 <- pressure_data[[7]] %>% filter(id == unique(pressure_data[[7]]$id)[1])
+  base_x <- max(sens_1$x) - min(sens_1$x)
+  base_y <- max(sens_1$y) - min(sens_1$y)
+  sens_rows_all <- nrow(pf_max)
+  sens_cols_all <- ncol(pf_max)
+  centroid_df <- data.frame(x = rep(seq(base_x / 2, by = base_x, length.out = sens_cols_all),
+                                    each = sens_rows_all),
+                            y = rep(seq((base_y * sens_rows_all) - (base_y / 2),
+                                        by = base_y * -1, length.out = sens_rows_all),
+                                    times = sens_cols_all))
+  centroids <- st_as_sf(centroid_df, coords = c("x", "y"))
+
+  ## chull
+  sens_coords_df <- pressure_data[[7]] %>%
+    st_as_sf(coords = c("x", "y"))
+  fp_chull <- st_convex_hull(st_combine(sens_coords_df))
+
+  ## in or out
+  pt_inter <- st_intersects(fp_chull, centroids)[[1]]
+
+  ## increase resistance
+  #inds <- 1:length(pf_max)
+  #inds <- inds[!inds %in% pt_inter]
+  #pf_max_v <- c(pf_max)
+  #pf_max_v[inds] <- 1000
+  #pf_max <- matrix(pf_max_v, nrow = sens_rows_all, ncol = sens_cols_all)
+
+  # take top half
   pf_max_top <- pf_max[1:(round(nrow(pf_max)) / 2), ]
-  pressure_data2 <- pressure_data
-  pressure_data2[[1]] <- pf_max_top
-  act_sens_vec <- which(pf_max_top > 0)
+  offset_row <- nrow(pf_max) - nrow(pf_max_top)
 
-  # remove small islands (toes)
-  ## make polygon df
-  polygons <- sens_df_2_polygon(pressure_data[[7]])
-  pg_df <- data.frame(sens_id = 1:length(polygons))
-  pg_df$geometry <- st_sfc(polygons)
-  pg_df <- st_as_sf(pg_df)
+  # remove islands
+  ## get vertex coords
+  verts <- pressure_data[[7]]
 
-  ## find islands
-  geometries <- st_cast(st_union(st_buffer(pg_df, 0.0001)), "POLYGON")
-  dissolved <- st_sf(geometries)
-  dissolved$clusterID = 1:length(geometries)
-  pg_df <- st_join(pg_df, dissolved)
+  ## remove duplicates (id included)
+  verts <- verts %>% distinct()
 
-  ## remove small islands
-  pg_df <- pg_df %>% filter(clusterID == which.max(table(pg_df$clusterID)))
-  sens_keep <- pg_df[["sens_id"]]
-  sens_keep <- act_sens_vec[sens_keep]
-  pf_max_top_vec <- c(pf_max_top)
-  zeros <- c(1:length(pf_max_top_vec))
-  zeros <- zeros[!zeros %in% sens_keep]
-  pf_max_top_vec[zeros] <- 0
-  pf_max_top2 <- matrix(pf_max_top_vec, nrow = nrow(pf_max_top), ncol = ncol(pf_max_top))
+  ## count duplicates (coords only) and add count to df
+  verts_ <- verts[, c(1, 2)]
+  verts_ <- verts_ %>% group_by(across(everything())) %>%
+    mutate(n = n())
+  verts <- cbind(verts, n = verts_$n)
 
-  # which cols had toes removed
-  good_cols <- rep(NA, length.out = ncol(pf_max))
-  for (i in 1:ncol(pf_max)) {
-    og <- which.max(pf_max_top[, i] > 0)
-    og_rm <- which.max(pf_max_top2[, i] > 0)
-    if (og != og_rm) {good_cols[i] <- og_rm - 2}
+  ## sum sensor duplicates
+  sens_verts <- verts %>% group_by(id) %>% summarize(ns = sum(n))
+
+  # toe line
+  ## start and end points
+  active_cols <- which(apply(pf_max_top, 2, var) != 0)
+  active_rows <- which(apply(pf_max_top, 1, var) != 0)
+  active_row_top <- active_rows[1]
+  active_row_bottom <- active_rows[length(active_rows)]
+  row_25 <- active_row_top + ((active_row_bottom - active_row_top) * 0.6)
+  row_70 <- active_row_top + ((active_row_bottom - active_row_top) * 0.3)
+
+  ## start point
+  start_y <- (nrow(pf_max_top) * base_y) - (row_70 * base_y)
+  end_y <- (nrow(pf_max_top) * base_y) - (row_25 * base_y)
+  if (side == "LEFT") {
+    start_x <- (active_cols[length(active_cols)] * base_x) - base_x / 2
+    end_x <- (active_cols[1] * base_x) - base_x / 2
+    start <- c(start_x, start_y)
+    end <- c(end_x, end_y)
+  }
+  if (side == "RIGHT") {
+    start_x <- (active_cols[1] * base_x) + base_x / 2
+    end_x <- (active_cols[length(active_cols)] * base_x) - base_x / 2
+    start <- c(start_x, start_y)
+    end <- c(end_x, end_y)
   }
 
-  # remove negative values
-  good_cols[good_cols < 1] <- NA
+  # make sure start and end are low
+  start_ind <- c((start[1] + (base_x / 2)) / base_x,
+                 ceiling(((nrow(pf_max_top) * base_y) - start[2]) / base_y) + 1)
+  end_ind <- c((end[1] + (base_x / 2)) / base_x,
+               ceiling(((nrow(pf_max_top) * base_y) - end[2]) / base_y) + 1)
+  #pf_max_top[start_ind[2], start_ind[1]] <- 0
+  #pf_max_top[end_ind[2], end_ind[1]] <- 0
+  #pf_max_top[start_ind[2], start_ind[1] -1] <- 1000
+  #pf_max_top[start_ind[2] + 1, start_ind[1] - 1] <- 1000
 
-  # which of the remaining cols have minima between two maxima
-  remaining_cols <- which(is.na(good_cols))
-  for (i in seq_along(remaining_cols)) {
-    mins <- which(rollapply(as.zoo(pf_max_top[, remaining_cols[i]]), 3,
-                            function(x) which.min(x) == 2) == TRUE)
-    mins_rev <- which(rollapply(as.zoo(rev(pf_max_top[, remaining_cols[i]])), 3,
-                                function(x) which.min(x) == 2) == TRUE)
-    maxs <- which(rollapply(as.zoo(pf_max_top[, remaining_cols[i]]), 3,
-                            function(x) which.max(x) == 2) == TRUE)
-    if (length(maxs) >= 2) {
-      if (mins[1] > maxs[1] & mins[1] < maxs[2]) {
-        reps <- rle(pf_max_top[(mins[1] + 1):ncol(pf_max_top), remaining_cols[i]])$lengths[1]
-        if (reps > 1) {
-          good_cols[i] <- mins[1] + (reps / 2)
-        } else {good_cols[remaining_cols[i]] <- mins[1]}
-      }
-    }
-  }
+  # make raster
+  pf_max_top <- pf_max_top / 100000
+  r <- raster(pf_max_top)
+  raster::extent(r) <- c(min(pressure_data[[7]][, 1]),
+                         base_x * ncol(pf_max_top),
+                         min(pressure_data[[7]][, 2]),
+                         base_y * nrow(pf_max_top))
 
-  # check points are less than 1/3 from front of foot but > 15%
-  ff_dist <- round(nrow(pf_max) / 6)
-  ff_prox <- round(nrow(pf_max) / 12)
-  remaining_cols2 <- which(!is.na(good_cols))
-  for (fp_col in seq_along(remaining_cols2)) {
-    if ((good_cols[remaining_cols2[fp_col]] - (which(pf_max_top[, remaining_cols2[fp_col]] > 0)[1])) >= ff_dist) {
-      good_cols[remaining_cols2[fp_col]] <- NA
-    }
-  }
-  remaining_cols3 <- which(!is.na(good_cols))
-  for (fp_col in seq_along(remaining_cols3)) {
-    if ((good_cols[remaining_cols3[fp_col]] - (which(pf_max_top[, remaining_cols3[fp_col]] > 0)[1])) < ff_prox) {
-      good_cols[remaining_cols3[fp_col]] <- NA
-    }
-  }
+  # line
+  heightDiff <- function(x){x[2] - x[1]}
+  hd <- transition(r, heightDiff, 8, symm = FALSE)
+  slope <- geoCorrection(hd, type = "c")
+  adj <- adjacent(r, cells = 1:ncell(r), pairs = TRUE, directions = 8)
+  speed <- slope
+  speed[adj] <- 6 * exp(-3.5 * abs(slope[adj]))
+  Conductance <- geoCorrection(speed)
+  AtoB <- shortestPath(Conductance, start, end, output = "SpatialLines")
+  toe_line_mat <- st_coordinates(st_as_sf(AtoB))[, c(1, 2)]
 
-  # coords
-  toe_line_mat <- matrix(NA, length(good_cols), 2)
-  dims <- c(0.005, 0.005)
-  for (i in 1:length(good_cols)) {
-    if (is.na(good_cols[i]) != TRUE) {
-      xy <- c(-(dims[2] / 2) + (dims[2] * i),
-              (-(dims[1] / 2) + (nrow(pf_max) * dims[1]) - dims[1] * good_cols[i]))
-      toe_line_mat[i, ] <- xy
-    }
-  }
-  toe_line_mat <- na.omit(toe_line_mat)
+  # trim to widest
+  toe_line_mat <- toe_line_mat[which.max(toe_line_mat[, 1]):which.min(toe_line_mat[, 1]), ]
 
   # extend ends
-  toe_line_mat <- rbind(c(toe_line_mat[1, 1] - 1, toe_line_mat[1, 2]), toe_line_mat,
-                        c(toe_line_mat[nrow(toe_line_mat), 1] + 1,
-                          toe_line_mat[nrow(toe_line_mat), 2]))
+  if (side == "LEFT") {
+    toe_line_mat <- rbind(c(toe_line_mat[1, 1] + 1, toe_line_mat[1, 2]), toe_line_mat,
+                          c(toe_line_mat[nrow(toe_line_mat), 1] - 1,
+                            toe_line_mat[nrow(toe_line_mat), 2]))
+  }
+  if (side == "RIGHT") {
+    toe_line_mat <- rbind(c(toe_line_mat[1, 1] + 1, toe_line_mat[1, 2]), toe_line_mat,
+                          c(toe_line_mat[nrow(toe_line_mat), 1] - 1,
+                            toe_line_mat[nrow(toe_line_mat), 2]))
+  }
 
-  #toe_path_df <- as.data.frame(cbind(toe_line_mat[, 1], toe_line_mat[, 2]))
-  #colnames(toe_path_df) <- c("x", "y")
-  #g <- plot_pressure(pressure_data)
-  #g <- g + geom_path(data = toe_path_df, aes(x = x, y = y), color = "red")
-  #g
+  # add offset distance
+  toe_line_mat[, 2] <- toe_line_mat[, 2] + (offset_row * base_y)
 
   # return
   return(toe_line_mat)
@@ -3049,6 +3166,22 @@ pressure_peak <- function(pressure_data, sens_mask_df, mask) {
 }
 
 
+#' @title Peak pressure time series
+#' @description get highest value of sensor in mask per frame
+#' @noRd
+
+pressure_peak_ts <- function(pressure_data, sens_mask_df, mask) {
+  val_ts <- rep(NA, nrow(pressure_data))
+  # analysis
+  for (i in 1:nrow(pressure_data)) {
+    val_ts[i] <- max(pressure_data[i, which(sens_mask_df[, mask] > 0)])
+  }
+
+  # return
+  return(val_ts)
+}
+
+
 #' @title Mean regional pressure
 #' @description get average pressure across mask. Defined as highest force in
 #' mask over maximum contact area
@@ -3169,6 +3302,21 @@ force_peak <- function(pressure_data_, pressure_data, sens_mask_df, mask) {
   return(val)
 }
 
+#' @title Force time series
+#' @description Calculate force per frame
+#' @noRd
+
+force_ts <- function(pressure_data_, pressure_data, sens_mask_df, mask) {
+  force <- rep(NA, nrow(pressure_data_))
+  for (i in 1:nrow(pressure_data_)) {
+    P <- pressure_data_[i, ] * pressure_data[[3]] * 1000
+    force[i] <- sum(P * sens_mask_df[, mask])
+  }
+
+  # return
+  return(force)
+}
+
 
 #' @title threshold event
 #' @description defines threshold based on force value
@@ -3184,9 +3332,16 @@ threshold_event <- function(pressure_data, threshold = "auto", min_frames, side)
 
   # Adjust thresholds to avoid errors
   min_f <- min(force)
+  max_f <- max(force)
   if (threshold == "auto") {
-    thresh <- min_f + 10
-  } else {thresh <- threshold + 0.01}
+    thresh <- min_f + (0.1 * (max_f - min_f))
+  } else {
+    if (is.numeric(threshold) == TRUE) {
+      thresh <- threshold + 0.01
+    } else {
+        stop("threshold can be auto or a numeric value")
+    }
+  }
 
   # throw error if threshold is less than min of trial
   if (min_f > thresh) {
@@ -3337,7 +3492,7 @@ automask <- function(pressure_data, mask_scheme, foot_side = "auto",
                       forefoot_mask = ff_mask)
   } else if (mask_scheme == "automask_novel") {
     ## toe line
-    toe_line_mat <- toe_line(pressure_data)
+    toe_line_mat <- toe_line(pressure_data, side)
 
     ## toe cut polygons
     toe_poly_prox <- st_line2polygon(as.matrix(toe_line_mat), 1, "-Y")
@@ -3669,6 +3824,58 @@ pedar_mask3 <- function(pressure_data) {
 }
 
 
+
+#' @title Dynamic Plantar Loading Index
+#' @description Determine Dynamic plantar loading index (DPLI) for
+#' footprint pressure data
+#' @param pressure_data List. First item is a 2D array covering each timepoint
+#' of the measurement.
+#' @param n_bins Numeric. Number of bins used to calculate DPLI
+#' @returns Data frame. Contains DPLI for each step
+#' @examples
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' pressure_data <- create_mask_auto(pressure_data, "automask_novel")
+#' pressure_data_ <- pressure_data[[1]]
+#' dpli(pressure_data_, pressure_data, sens_mask_df, 1)
+#' @importFrom graphics hist
+#' @importFrom stats dnorm lm sd
+#' @noRd
+
+dpli <- function(pressure_data_, pressure_data, sens_mask_df, mask,
+                 n_bins = 30) {
+  # row_max
+  press_mat <- pressure_data_[, which(sens_mask_df[mask] > 0)]
+  press_vec <- apply(press_mat, 1, max)
+
+  # remove empty values from begining and end
+  press_vec <- press_vec[min(which(press_vec != 0)):max(which(press_vec != 0))]
+
+  # interpolate to 101
+  press_vec <- approxP(press_vec, 101)
+
+  # bin data
+  binned <- hist(press_vec, breaks = seq(from = min(press_vec),
+                                         to = max(press_vec),
+                                         length.out = n_bins + 1),
+                 plot = FALSE)
+
+  # get distribution
+  sd_press <- sd(press_vec)
+  mean_press <- mean(press_vec)
+  norm_dist <- dnorm(binned$mids, mean_press, sd_press)
+  norm_dist <- norm_dist * (max(binned$counts) / max(norm_dist))
+
+  # get r^2 (dpli)
+  val <- summary(lm(binned$counts ~ norm_dist))$adj.r.squared
+
+  # return
+  return(val)
+}
+
+
+# =============================================================================
+
 # data
 pedar_insole_area <- function() {
   pedar_insole_areas <- data.frame(u = c(126, 129, 129, 129, 129, 126, 126, 125,
@@ -3736,6 +3943,19 @@ pedar_insole_area <- function() {
                                          194, 194, 191, 190, 191, 190, 191, 190,
                                          190, 187, 186, 187, 186, 187, 186, 192,
                                          191, 193, 192),
+                                   z = c(214, 221, 220, 221, 219, 213, 216, 216,
+                                         213, 216, 214, 214, 219, 220, 220, 218,
+                                         220, 220, 219, 215, 214, 215, 213, 215,
+                                         214, 215, 219, 217, 219, 217, 218, 217,
+                                         219, 222, 223, 223, 222, 223, 222, 223,
+                                         214, 215, 214, 214, 215, 214, 215, 216,
+                                         216, 215, 217, 216, 216, 216, 219, 218,
+                                         219, 219, 219, 218, 219, 217, 216, 217,
+                                         216, 218, 216, 217, 221, 222, 221, 222,
+                                         222, 221, 222, 218, 219, 218, 219, 218,
+                                         218, 219, 214, 214, 214, 214, 214, 214,
+                                         214, 209, 208, 208, 208, 208, 209, 215,
+                                         216, 217, 217),
                                    uw = c(114, 101, 107, 101, 114, 103, 115, 114,
                                           115, 114, 113, 105, 121, 123, 122, 122,
                                           122, 121, 123, 127, 129, 128, 127, 128,
