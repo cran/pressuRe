@@ -1,18 +1,20 @@
 # to do (current version)
-# pliance if sensors matrix then add max_matrix
-# fscan processing needs to be checked (work with NA?)
-# in edit_mask, make edit_list a vector that works with numbers or names?
-# change pedar_polygon to sensel_polygon
-# create mask manual work with internal hole
-# make capture frequency a vector to allow for uneven sampling
+## low cost paths to define heel and forefoot automasks
+## low cost path to define hallux automask
+## pliance if sensors matrix then add max_matrix
+## fscan processing needs to be checked (work with NA?)
+## in edit_mask, make edit_list a vector that works with numbers or names?
+## change pedar_polygon to sensel_polygon
+## create mask manual work with internal hole
+## make capture frequency a vector to allow for uneven sampling
 
 # to do (future)
-# global pressure_import function (leave for V2)
-# create masks for iscan during startup
-# CPEI manual edit to be built into function
-# add more input tests to throw errors
-# cop for pedar
-# UNITS!!!
+## global pressure_import function (leave for V2)
+## create masks for iscan during startup
+## CPEI manual edit to be built into function
+## add more input tests to throw errors
+## cop for pedar
+## UNITS!!!
 
 # data list:
 ## Array. pressure data
@@ -28,8 +30,10 @@
 
 #' @title Load emed data
 #' @description Imports and formats .lst files collected on emed system and
-#'    exported from Novel software
+#'   exported from Novel software
 #' @param pressure_filepath String. Filepath pointing to emed pressure file
+#' @param trim_active Logical. Restricts frames to only the first continuous
+#'   foot contact
 #' @return A list with information about the pressure data.
 #' \itemize{
 #'   \item pressure_array. 3D array covering each timepoint of the measurement.
@@ -49,7 +53,7 @@
 #' @importFrom utils read.fwf read.table
 #' @export
 
-load_emed <- function(pressure_filepath) {
+load_emed <- function(pressure_filepath, trim_active = FALSE) {
   # check parameters
   ## file exists
   if (file.exists(pressure_filepath) == FALSE)
@@ -158,6 +162,21 @@ load_emed <- function(pressure_filepath) {
   full_mat <- matrix(NA, nrow = dim(pressure_array)[3], ncol = nrow(active_sensors))
   for (i in 1:dim(pressure_array)[3]) {
     full_mat[i, ] <- pressure_array[, , i][active_sensors]
+  }
+
+  ## reduce to active continuous contact
+  if (trim_active == TRUE) {
+    # force vector
+    fv_ <- full_mat * sens_areas * 1000
+    fv <- rowSums(fv_)
+
+    # detect start and end
+    str_f <- which(fv > 0)[1]
+    end_f_ <- which(fv < 10)
+    end_f <- end_f_[which(end_f_ > (str_f + 20))][1]
+
+    # trim array
+    full_mat <- full_mat[c(str_f:end_f),]
   }
 
   # return formatted emed data
@@ -369,11 +388,10 @@ load_pliance <- function(pressure_filepath) {
 #'   \item sensor_polygons. Data frame with corners of sensors
 #'   \item max_matrix. Matrix
 #'  }
-#'  @examples
+#' @examples
 #' tekscan_data <- system.file("extdata", "fscan_testL.asf", package = "pressuRe")
 #' pressure_data <- load_tekscan(tekscan_data)
-#'  @importFrom
-#'  @export
+#' @export
 
 load_tekscan <- function(pressure_filepath) {
   # check parameters
@@ -470,11 +488,11 @@ load_tekscan <- function(pressure_filepath) {
 #'   \item sensor_polygons. Data frame with corners of sensors
 #'   \item max_matrix. Matrix
 #'  }
-#'  @examples
+#' @examples
 #' footscan_data <- system.file("extdata", "footscan_test.xls", package = "pressuRe")
 #' pressure_data <- load_footscan(footscan_data)
-#'  @importFrom readxl read_excel
-#'  @export
+#' @importFrom readxl read_excel
+#' @export
 
 load_footscan <- function(pressure_filepath) {
   # check parameters
@@ -558,11 +576,11 @@ load_footscan <- function(pressure_filepath) {
 #'   \item sensor_polygons. Data frame with corners of sensors
 #'   \item max_matrix. Matrix
 #'  }
-#'  @examples
+#' @examples
 #' xsensor_data <- system.file("extdata", "xsensor_data.csv", package = "pressuRe")
 #' pressure_data <- load_xsensor(xsensor_data)
-#'  @importFrom abind abind
-#'  @export
+#' @importFrom abind abind
+#' @export
 load_xsensor <- function(pressure_filepath) {
   # check parameters
   ## file exists
@@ -737,7 +755,7 @@ pressure_interp <- function(pressure_data, interp_to) {
 #'   \item sens_size. Numeric vector with the dimensions of the sensors
 #'   \item time. Numeric value for time between measurements
 #'   \item masks. List
-#'   \item events. List
+#'   \item events. Data frame
 #'   \item sensor_polygons. Data frame with corners of sensors
 #'   \item max_matrix. Matrix
 #'   }
@@ -814,8 +832,8 @@ select_steps <- function (pressure_data, threshold = "auto", min_frames = 10,
 #' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
 #' pressure_data <- load_emed(emed_data)
 #' auto_detect_side(pressure_data)
-#' @importFrom sf st_polygon st_as_sf st_convex_hull st_combine
-#' st_intersection st_area
+#' @importFrom sf st_polygon st_as_sf st_area st_filter st_convex_hull
+#' st_intersection
 #' @importFrom stats dist
 #' @export
 
@@ -830,31 +848,57 @@ auto_detect_side <- function(pressure_data) {
   side1 <- mbb[c(1, 2), ]
   side2 <- mbb[c(3, 4), ]
 
-  # get midpoints
-  midpoint_top <- (side1[2, ] + side2[2, ]) / 2
-  midpoint_bottom <- (side1[1, ] + side2[1, ]) / 2
+  # get points
+  side1_30 <- side1[1, ] + ((side1[2, ] - side1[1, ]) * 0.3)
+  side2_30 <- side2[1, ] + ((side2[2, ] - side2[1, ]) * 0.3)
+  side1_60 <- side1[1, ] + ((side1[2, ] - side1[1, ]) * 0.7)
+  side2_60 <- side2[1, ] + ((side2[2, ] - side2[1, ]) * 0.7)
+  midpt_30 <- (side1_30 + side2_30) / 2
+  midpt_60 <- (side1_60 + side2_60) / 2
+  midpt_top <- (side1[2, ] + side2[2, ]) / 2
 
-  # make lat and med box
-  side1_pts <- rbind(side1, midpoint_top, midpoint_bottom, side1[1, ])
-  side2_pts <- rbind(side2, midpoint_top, midpoint_bottom, side2[1, ])
-  box1 <- st_polygon(list(side1_pts))
-  box2 <- st_polygon(list(side2_pts))
+  # make lat and med forefoot boxes
+  ff1_pts <- rbind(side1[2, ], midpt_top, midpt_60, side1_60, side1[2, ])
+  ff2_pts <- rbind(side2[2, ], midpt_top, midpt_60, side2_60, side2[2, ])
+  ffbox1 <- st_polygon(list(ff1_pts))
+  ffbox2 <- st_polygon(list(ff2_pts))
+
+  # make lat and med midfoot boxes
+  mf1_pts <- rbind(side1_60, midpt_60, midpt_30, side1_30, side1_60)
+  mf2_pts <- rbind(side2_60, midpt_60, midpt_30, side2_30, side2_60)
+  mfbox1 <- st_polygon(list(mf1_pts))
+  mfbox2 <- st_polygon(list(mf2_pts))
 
   # make chull
   df.sf <- pressure_data[[7]][, c(1, 2)] %>%
     st_as_sf(coords = c( "x", "y" ))
   fp_chull <- st_convex_hull(st_combine(df.sf))
 
+  # count
+  #ffbox1_count <- length(st_filter(df.sf, ffbox1)[[1]])
+  #ffbox2_count <- length(st_filter(df.sf, ffbox2)[[1]])
+  mfbox1_count <- length(st_filter(df.sf, mfbox1)[[1]])
+  mfbox2_count <- length(st_filter(df.sf, mfbox2)[[1]])
+
   # area in each half box
-  side1_count <- st_area(st_intersection(fp_chull, box1))
-  side2_count <- st_area(st_intersection(fp_chull, box2))
+  ffbox1_count <- st_area(st_intersection(fp_chull, ffbox1))
+  ffbox2_count <- st_area(st_intersection(fp_chull, ffbox2))
+
+  # ratio
+  ff_ratio <- ffbox1_count / ffbox2_count
+  mf_ratio <- mfbox2_count / mfbox1_count
+  weighted_ratios <- mean(c(ff_ratio, mf_ratio))
+  #count_1 <- ffbox1_count
+  #count_2 <- ffbox2_count
 
   # side
-  if (side1_count < side2_count) {
-    side <- "RIGHT"
-  } else {
-    side <- "LEFT"
-  }
+  if (weighted_ratios < 1) {side <- "RIGHT"}
+  if (weighted_ratios > 1) {side <- "LEFT"}
+  #if (count_1 < count_2) {
+  #  side <- "RIGHT"
+  ##} else {
+  #  side <- "LEFT"
+  #}
 
   # Return side
   return(side)
@@ -1116,6 +1160,7 @@ footprint <- function(pressure_data, variable = "max", frame = NULL,
 #'   between sensors to increase data density
 #' @param plot_COP Logical. If TRUE, overlay COP data on plot. Default = FALSE
 #' @param plot_outline Logical. If TRUE, overlay convex hull outline on plot
+#' @param plot_masks Logical. If TRUE, overlay mask outline on plot
 #' @param plot_colors String. "default": novel color scheme; "custom": user
 #' supplied
 #' @param break_values Vector. If plot_colors is "custom", values to split
@@ -1138,8 +1183,9 @@ footprint <- function(pressure_data, variable = "max", frame = NULL,
 #' @importFrom scales manual_pal
 #' @export
 
-plot_pressure <- function(pressure_data, variable = "max", smooth = FALSE, frame,
-                          step_n = "max", plot_COP = FALSE, plot_outline = FALSE,
+plot_pressure <- function(pressure_data, variable = "max", smooth = FALSE,
+                          frame, step_n = "max", plot_COP = FALSE,
+                          plot_outline = FALSE, plot_masks = FALSE,
                           plot_colors = "default", break_values, break_colors,
                           sensor_outline = TRUE, plot = TRUE, legend = TRUE) {
   # set global variables
@@ -1223,6 +1269,18 @@ plot_pressure <- function(pressure_data, variable = "max", smooth = FALSE, frame
     ch_out <- as.data.frame(ch_out)[, c(1, 2)]
     g <- g + geom_path(data = ch_out, aes(x = X, y = Y), colour = "black")
     g <- g + geom_point(data = ch_out, aes(x = X, y = Y), colour = "purple")
+  }
+
+  # add masks
+  if (plot_masks == TRUE) {
+    masks <- pressure_data[[5]]
+    if (length(masks != 0)) {
+      for (n_mask in 1:length(masks)) {
+        mask_plt_df <- data.frame(st_coordinates(masks[[n_mask]])[,1:2])
+        g <- g + geom_path(data = mask_plt_df, aes(X, Y), color = "red",
+                           linewidth = 1)
+      }
+    }
   }
 
   # formatting
@@ -1498,23 +1556,30 @@ create_mask_manual <- function(pressure_data, mask_definition = "by_vertices", n
 #' @param pressure_data List. First item is a 3D array covering each timepoint
 #' of the measurement. z dimension represents time
 #' @param masking_scheme String. "automask_simple", "automask_novel",
-#' "pedar_mask1", "pedar_mask2", "pedar_mask3".
+#' "pedar_mask1", "pedar_mask2", "pedar_mask3", "template".
 #' "simple_automask" applies a simple 3 part mask (hindfoot, midfoot, forefoot)
 #' "automask_novel" attempts to apply a 9-part mask (hindfoot, midfoot, mets,
 #' hallux, lesser toes), similar to the standard novel automask
 #' "pedar_mask1" splits the insole into 4 regions using sensel boundaries:
-#' hindfoot, midfoot, forefoot, and toes- https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9470545/
+#' hindfoot, midfoot, forefoot, and toes-
+#' https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9470545/
 #' "pedar_mask2" splits the insole into 4 regions using percentages:
-#' hindfoot, forefoot, hallux, and lesser toes- https://jfootankleres.biomedcentral.com/articles/10.1186/1757-1146-7-18
+#' hindfoot, forefoot, hallux, and lesser toes-
+#' https://jfootankleres.biomedcentral.com/articles/10.1186/1757-1146-7-18
 #' "pedar_mask3" splits the foot into 9 regions using sensel boundaries:
 #'  medial hindfoot, lateral hindfoot, medial midfoot, lateral midfoot, MTPJ1,
-#'  MTPJ2-3, MTPJ4-5, hallux, and lesser toes- https://jfootankleres.biomedcentral.com/articles/10.1186/1757-1146-7-20
+#'  MTPJ2-3, MTPJ4-5, hallux, and lesser toes-
+#'  https://jfootankleres.biomedcentral.com/articles/10.1186/1757-1146-7-20
 #' @param foot_side String. "RIGHT", "LEFT", or "auto". Auto uses
 #' auto_detect_side function
-#' @param res_value Numeric. Adjusting this can help if the line between the forefoot and toes
-#' isn't correct. Default is 100000. This line is calculated using a least cost function and this
-#' parameter basically adjusts the resistance of the pressure value for that algorithm
+#' @param res_value Numeric vector. Adjusting these values can help if the heel,
+#' midfoot, toe, and hallux lines aren't correct. Default values are c(10000,
+#' 10000, 100000, 10000). These lines are calculated using a least cost function
+#' and the parameter essentially adjusts the resistance of the pressure value
+#' for that algorithm
 #' @param plot Logical. Whether to play the animation
+#' @param template_mask Data frame. Mask to be used if "template_mask" is
+#' selected as the masking scheme
 #' @return List. Masks are added to pressure data variable
 #' \itemize{
 #'   \item pressure_array. 3D array covering each timepoint of the measurement.
@@ -1529,25 +1594,29 @@ create_mask_manual <- function(pressure_data, mask_definition = "by_vertices", n
 #' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
 #' pressure_data <- load_emed(emed_data)
 #' pressure_data <- create_mask_auto(pressure_data, "automask_novel",
-#' res_value = 100000, foot_side = "auto", plot = FALSE)
+#' res_value = c(20000, 20000, 100000, 20000), foot_side = "auto", plot = FALSE)
 #' @importFrom zoo rollapply
 #' @importFrom sf st_union st_difference
 #' @export
 
 create_mask_auto <- function(pressure_data, masking_scheme, foot_side = "auto",
-                             res_value = 10000, plot = TRUE) {
+                             res_value = c(20000, 20000, 100000, 20000),
+                             plot = TRUE, template_mask = NULL) {
   # simple
   if (masking_scheme == "automask_simple") {
     if (pressure_data[[2]] == "pedar")
       stop("automask is not compatible with this type of data")
-    pressure_data <- automask(pressure_data, "automask_simple", plot = FALSE)
+    pressure_data <- automask(pressure_data, res_scale = res_value,
+                              "automask_simple", foot_side = foot_side,
+                              plot = FALSE)
   }
 
-  ## full
+  # full auto mask novel
   if (masking_scheme == "automask_novel") {
     if (!(pressure_data[[2]] == "emed" || pressure_data[[2]] == "pliance"))
       stop("automask is not compatible with this type of data")
-    pressure_data <- automask(pressure_data, "automask_novel", res_scale = res_value,
+    pressure_data <- automask(pressure_data, "automask_novel",
+                              res_scale = res_value, foot_side = foot_side,
                               plot = FALSE)
   }
 
@@ -1571,6 +1640,11 @@ create_mask_auto <- function(pressure_data, masking_scheme, foot_side = "auto",
     if (pressure_data[[2]] != "pedar")
       stop("pedar_mask3 is not compatible with this type of data")
     pressure_data[[5]] <- pedar_mask3(pressure_data)
+  }
+
+  # apply a template mask
+  if (masking_scheme == "template") {
+    pressure_data <- align_mask(pressure_data, template_mask)
   }
 
   # plot masks
@@ -1627,6 +1701,9 @@ edit_mask <- function(pressure_data, n_edit, threshold = 0.002,
   X <- Y <- NULL
 
   if (n_edit > 0) {
+    # initialize plot
+    grDevices::x11()
+
     # plot original mask data
     g <- plot_masks(pressure_data, image = image)
 
@@ -1710,8 +1787,8 @@ edit_mask <- function(pressure_data, n_edit, threshold = 0.002,
 #' @author Scott Telfer \email{scott.telfer@gmail.com}
 #' @param pressure_data List. First item is a 3D array covering each timepoint
 #' of the measurement. Not currently available for pedar.
-#' @param foot_side String. "right" or "left". Required for automatic detection of
-#'   points
+#' @param foot_side String. "right" or "left". Required for automatic detection
+#' of points
 #' @param plot_result Logical. Plots pressure image with COP and CPEI overlaid
 #' @return Numeric. CPEI value
 #' @examplesIf interactive()
@@ -1719,6 +1796,7 @@ edit_mask <- function(pressure_data, n_edit, threshold = 0.002,
 #' pressure_data <- load_emed(emed_data)
 #' cpei(pressure_data, foot_side = "auto", plot_result = FALSE)
 #' @importFrom sf st_convex_hull st_linestring st_distance st_coordinates
+#' st_intersection
 #' @importFrom dplyr pull summarise
 #' @export
 
@@ -1932,7 +2010,7 @@ cpei <- function(pressure_data, foot_side, plot_result = TRUE) {
 #' pressure_data <- load_emed(emed_data)
 #' pressure_data <- create_mask_auto(pressure_data, "automask_simple", plot = FALSE)
 #' mask_analysis(pressure_data, FALSE, variable = "press_peak_sensor")
-#' @importFrom sf st_intersects st_geometry st_area
+#' @importFrom sf st_intersects st_geometry st_area st_intersection
 #' @importFrom pracma trapz
 #' @export
 
@@ -1987,7 +2065,7 @@ mask_analysis <- function(pressure_data, partial_sensors = FALSE,
 
   # include partial sensors?
   if (partial_sensors == FALSE) {
-    sens_mask_df[sens_mask_df < 1 & sens_mask_df > 0] <- 0
+    sens_mask_df[sens_mask_df < 0.999 & sens_mask_df > 0] <- 0
   }
 
   # create blank output dataframes
@@ -2005,13 +2083,15 @@ mask_analysis <- function(pressure_data, partial_sensors = FALSE,
   # process
   if (length(pressure_data[[6]]) == 0) {
     n_cycle = 1
+    has_events <- FALSE
   } else {
     n_cycle = nrow(pressure_data[[6]])
+    has_events <- TRUE
   }
   for (cycle in 1:n_cycle) {
     # get step data
     pressure_data_ <- pressure_data[[1]]
-    if (n_cycle > 1) {
+    if (n_cycle >= 1 & has_events == TRUE) {
       cyc_str <- unname(unlist(pressure_data[[6]][cycle, 2]))
       cyc_end <- unname(unlist(pressure_data[[6]][cycle, 3]))
       pressure_data_ <- pressure_data_[c(cyc_str:cyc_end), ]
@@ -2169,7 +2249,7 @@ mask_analysis <- function(pressure_data, partial_sensors = FALSE,
 #' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
 #' pressure_data <- load_emed(emed_data)
 #' arch_index(pressure_data)
-#' @importFrom sf st_bbox
+#' @importFrom sf st_bbox st_intersection
 #' @export
 
 arch_index <- function(pressure_data, plot = TRUE) {
@@ -2439,7 +2519,7 @@ getMinBBox <- function(xy) {
 
   mat <- rbind(side1_, side2_)
 
-  #return(list(pts=pts, width=widths[eMin], height=heights[eMin]))
+  # return
   return(mat)
 }
 
@@ -2488,22 +2568,17 @@ masks_2_df <- function(masks) {
 
 sensor_coords <- function(pressure_data, pressure_image = "all_active", frame) {
   # pressure image
-  if (pressure_image == "all_active" | pressure_image == "max" |
-      pressure_image == "mean") {
+  if (pressure_image == "all" | pressure_image == "all_active" |
+      pressure_image == "max" | pressure_image == "mean") {
     sens <- footprint(pressure_data, variable = "max")
-  }
-  if (pressure_image == "all") {
-    dims <- dim(pressure_data[[1]])
-    sens <- matrix(rep(10, length.out = dims[1] * dims[2]), nrow = dims[1],
-                   ncol = dims[2])
   }
   if (pressure_image == "frame") {
     sens <- footprint(pressure_data, variable = "frame", frame = frame)
   }
 
   # dimensions
-  sens_x <- pressure_data[[3]][1]
-  sens_y <- pressure_data[[3]][2]
+  sens_x <- abs(unique(pressure_data$sens_polygons$x)[2] - unique(pressure_data$sens_polygons$x)[1])
+  sens_y <- abs(unique(pressure_data$sens_polygons$y)[2] - unique(pressure_data$sens_polygons$y)[1])
 
   # data frame with active sensors as coordinates
   x_cor <- seq(from = sens_x / 2, by = sens_x, length.out = ncol(sens))
@@ -2884,10 +2959,10 @@ plot_pedar <- function(pressure_data, pressure_image = "max",
 #' @param df Dataframe.
 #' @param col_type String. "default": novel color scheme; "custom": user
 #' supplied
-#' @param break_values Vector. Vector with break values to be used. Should be one
-#' shorter than break_values
+#' @param break_values Vector. Vector with break values to be used. Should be
+#' one longer than break_colors
 #' @param break_colors Vector. Vector with colors to be used. Should be one
-#' longer than break_values
+#' shorter than break_values
 #' @return Data frame.
 #' @noRd
 
@@ -2912,11 +2987,10 @@ generate_colors <- function(df, col_type = "default", break_values,
   }
 
   # add col column
-  df$cols <- cut(df$value, breaks = break_values,
-                 labels = break_colors)
+  df$cols <- cut(df$value, breaks = break_values, labels = break_colors)
 
-  #return
-  return (df)
+  # return
+  return(df)
 }
 
 #' @title extend st line
@@ -2930,18 +3004,18 @@ st_extend_line <- function(line, distance, end = "BOTH") {
   if (!(end %in% c("BOTH", "HEAD", "TAIL")) | length(end) != 1)
     stop("'end' must be 'BOTH', 'HEAD' or 'TAIL'")
 
-  M <- st_coordinates(line)[,1:2]
+  M <- st_coordinates(line)[, 1:2]
   keep <- !(end == c("TAIL", "HEAD"))
 
   ends <- c(1, nrow(M))[keep]
   i <- c(2, nrow(M) - 1)
   j <- c(1, -1)
   headings <- mapply(i, j, FUN = function(i, j) {
-    Ax <- M[i-j,1]
-    Ay <- M[i-j,2]
-    Bx <- M[i,1]
-    By <- M[i,2]
-    unname(atan2(Ay-By, Ax-Bx))
+    Ax <- M[i - j, 1]
+    Ay <- M[i - j, 2]
+    Bx <- M[i, 1]
+    By <- M[i, 2]
+    unname(atan2(Ay - By, Ax - Bx))
   })
   #headings <- st_ends_heading(line)[keep]
   distances <- if (length(distance) == 1) rep(distance, 2) else rev(distance[1:2])
@@ -3001,6 +3075,73 @@ st_line2polygon <- function(mat, distance, direction) {
 }
 
 
+#' @title low cost path
+#' @description Calculates low cost path
+#' @param mat Matrix.
+#' @param offset_distance Numeric. If matrix does not start at 0, 0
+#' @param start Vector. x and y coords
+#' @param end Vector. x and y coords
+#' @param base_x Numeric
+#' @param base_y Numeric
+#' @param res_scale Numeric
+#' @param extend_line Logical. extends line horizontally
+#' @importFrom sf st_cast st_join st_sf
+#' @importFrom raster raster adjacent extent ncell
+#' @importFrom gdistance transition geoCorrection shortestPath
+#' @importFrom dplyr distinct group_by mutate n summarize across everything
+#' @importFrom stats var
+#' @noRd
+
+shortest_path <- function(mat, offset_distance, start, end, base_x, base_y,
+                          res_scale, extend_line = TRUE) {
+  ## scale
+  mat_norm <- mat / res_scale
+  r <- raster(mat_norm)
+  raster::extent(r) <- c(base_x * -1, base_x * (ncol(mat_norm) + 1),
+                         offset_distance,
+                         offset_distance + base_y * nrow(mat_norm))
+
+  # line
+  heightDiff <- function(x){x[2] - x[1]}
+  hd <- suppressWarnings(transition(r, heightDiff, 8, symm = FALSE))
+  slope <- geoCorrection(hd, type = "c")
+  adj <- adjacent(r, cells = 1:ncell(r), pairs = TRUE, directions = 8)
+  speed <- slope
+  speed[adj] <- 6 * exp(-3.5 * abs(slope[adj]))
+  Conductance <- geoCorrection(speed)
+  AtoB <- shortestPath(Conductance, start, end, output = "SpatialLines")
+  line_mat <- st_coordinates(st_as_sf(AtoB))[, c(1, 2)]
+
+  # extend line
+  if (extend_line == TRUE) {
+    if (line_mat[1, 1] > line_mat[nrow(line_mat), 1]) {
+      line_mat <- rbind(c(line_mat[1, 1] + 1, line_mat[1, 2]), line_mat,
+                        c(line_mat[nrow(line_mat), 1] - 1,
+                          line_mat[nrow(line_mat), 2]))
+    } else {
+      line_mat <- rbind(c(line_mat[1, 1] - 1, line_mat[1, 2]), line_mat,
+                        c(line_mat[nrow(line_mat), 1] + 1,
+                          line_mat[nrow(line_mat), 2]))
+    }
+  }
+
+  # remove colinear points
+  is_colinear <- function(p1, p2, p3) {
+    area <- abs((p1[1] * p2[2] + p2[1] * p3[2] + p3[1] * p1[2]) -
+      (p1[2] * p2[1] + p2[2] * p3[1] + p3[2] * p1[1])) / 2
+    return(area < 0.0000001)
+  }
+  line_df <- data.frame(x = line_mat[, 1], y = line_mat[, 2])
+  colinear_inds <- sapply(2:(nrow(line_df) - 1),
+                          function(i) is_colinear(line_df[i - 1, ], line_df[i, ],
+                                                  line_df[i + 1,]))
+  line_mat <- line_mat[!(c(FALSE, colinear_inds)), ]
+
+  # return
+  return(line_mat)
+}
+
+
 #' @title Get toe line
 #' @description Calculates line proximal to toes
 #' @param pressure_data List. First item should be a 3D array covering each
@@ -3020,7 +3161,8 @@ toe_line <- function(pressure_data, side, res_scale = 10000) {
   pf_max <- pressure_data[[8]]
 
   # sensor dimensions
-  sens_1 <- pressure_data[[7]] %>% filter(id == unique(pressure_data[[7]]$id)[50])
+  sens_1 <- pressure_data[[7]] %>%
+    filter(id == unique(pressure_data[[7]]$id)[50])
   base_x <- max(sens_1$x) - min(sens_1$x)
   base_y <- max(sens_1$y) - min(sens_1$y)
 
@@ -3042,7 +3184,7 @@ toe_line <- function(pressure_data, side, res_scale = 10000) {
   active_rows <- which(rowSums(pf_max_top) > 0)
   active_row_1 <- active_rows[1]
   row_25 <- round((nrow(pf_max_top) - active_row_1) * 0.25)
-  row_70 <- round((nrow(pf_max_top) - active_row_1) * 0.7)
+  row_70 <- round((nrow(pf_max_top) - active_row_1) * 0.6)
 
   ## start point
   start_y <- offset_distance + (nrow(pf_max_top) * base_y) -
@@ -3055,7 +3197,8 @@ toe_line <- function(pressure_data, side, res_scale = 10000) {
   }
   if (side == "RIGHT") {
     start_x <- ((active_cols[1] * base_x) - base_x / 2) - base_x
-    end_x <- (((active_cols[length(active_cols)] + 1) * base_x) - base_x / 2) + base_x
+    end_x <- (((active_cols[length(active_cols)] + 1) * base_x) - base_x / 2) +
+      base_x
   }
   start <- c(start_x, start_y)
   end <- c(end_x, end_y)
@@ -3064,47 +3207,10 @@ toe_line <- function(pressure_data, side, res_scale = 10000) {
   ## buffer columns
   buffer_col <- rep(0, times = nrow(pf_max_top))
   pf_max_top <- cbind(buffer_col, pf_max_top, buffer_col)
-  ## blockers at top
-  #act_row_1 <- which(rowSums(pf_max_top) > 0)[1]
-  #pf_max_top[act_row_1, ] <- rep(max(pf_max_top), times = ncol(pf_max_top))
-  #pf_max_top[c(act_row_1:(act_row_1 + 2)),
-  #           round(ncol(pf_max_top) / 2)] <- rep(max(pf_max_top), 3)
-
-  ## scale
-  pf_max_top <- pf_max_top / res_scale
-  r <- raster(pf_max_top)
-  raster::extent(r) <- c(base_x * -1, base_x * (ncol(pf_max_top) + 1),
-                         offset_distance,
-                         offset_distance + base_y * nrow(pf_max_top))
 
   # line
-  heightDiff <- function(x){x[2] - x[1]}
-  hd <- suppressWarnings(transition(r, heightDiff, 8, symm = FALSE))
-  slope <- geoCorrection(hd, type = "c")
-  adj <- adjacent(r, cells = 1:ncell(r), pairs = TRUE, directions = 8)
-  speed <- slope
-  speed[adj] <- 6 * exp(-3.5 * abs(slope[adj]))
-  Conductance <- geoCorrection(speed)
-  AtoB <- shortestPath(Conductance, start, end, output = "SpatialLines")
-  toe_line_mat <- st_coordinates(st_as_sf(AtoB))[, c(1, 2)]
-
-  # trim to widest
-  #toe_line_mat <- toe_line_mat[which.max(toe_line_mat[, 1]):which.min(toe_line_mat[, 1]), ]
-
-  # extend ends
-  if (side == "LEFT") {
-    toe_line_mat <- rbind(c(toe_line_mat[1, 1] + 1, toe_line_mat[1, 2]), toe_line_mat,
-                          c(toe_line_mat[nrow(toe_line_mat), 1] - 1,
-                            toe_line_mat[nrow(toe_line_mat), 2]))
-  }
-  if (side == "RIGHT") {
-    toe_line_mat <- rbind(c(toe_line_mat[1, 1] - 1, toe_line_mat[1, 2]), toe_line_mat,
-                          c(toe_line_mat[nrow(toe_line_mat), 1] + 1,
-                            toe_line_mat[nrow(toe_line_mat), 2]))
-  }
-
-  # add offset distance
-  #toe_line_mat[, 2] <- toe_line_mat[, 2] + (offset_row * base_y)
+  toe_line_mat <- shortest_path(mat = pf_max_top, offset_distance, start, end,
+                                base_x, base_y, res_scale)
 
   # return
   return(toe_line_mat)
@@ -3121,72 +3227,99 @@ toe_line <- function(pressure_data, side, res_scale = 10000) {
 
 edge_lines <- function(pressure_data, side) {
   # global variables
-  x <- y <- x_coord <- y_coord <- me <- sc_df <- NULL
+  x <- y <- x_coord <- y_coord <- me <- sc_df <- mbb <- NULL
 
   # max pressure image
   max_fp <- pressure_data[[8]]
 
   # coordinates
-  sens_coords <- pressure_data[[7]]
+  sens_coords <- pressure_data[[7]][, c(1, 2)]
+  sens_coords_m <- as.matrix(sens_coords)
+  mbb <- getMinBBox(sens_coords_m)
 
-  # Find longest vectors (these are the med and lat edges of the footprint)
-  ## unique y coordinates of sensors
-  unq_y <- unique(sens_coords$y)
+  # find chull
+  # Define convex hull, expanding to include all sensors
+  df_sf <- sens_coords %>%
+    st_as_sf(coords = c("x", "y"))
+  fp_chull <- st_convex_hull(st_union(df_sf))
+  fp_chull <- st_buffer(fp_chull, 0.0025)
 
-  ## how much to shorten by
-  shorten_n <- ceiling(ncol(max_fp) / 10)
-  unq_y_short <- unq_y[-match(tail(sort(unq_y), shorten_n), unq_y)]
-  unq_y_short <- unq_y_short[-match(head(sort(unq_y_short), shorten_n),
-                                    unq_y_short)]
+  # find foot angle
+  side1 <- mbb[c(1:2), ]
+  foot_angle_ <- atan((side1[2, 1] - side1[1, 1]) / (side1[2, 2] - side1[1, 2]))
+  foot_ang <- foot_angle_ * 180 / pi
 
-  ## make edges
-  med_edge <- data.frame(x = rep(NA, length.out = length(unq_y_short)),
-                         y = unq_y_short)
-  lat_edge <- med_edge
-  for (i in 1:length(unq_y_short)) {
-    med_edge[i, 1] <- sens_coords %>% filter(y == unq_y_short[i]) %>%
-      summarise(me = max(x)) %>% pull(me)
-    lat_edge[i, 1] <- sens_coords %>% filter(y == unq_y_short[i]) %>%
-      summarise(me = min(x)) %>% pull(me)
-  }
+  # polys
+  poly_08_up <- cx_poly(sens_coords_m, 0.8, "+Y")
+  poly_075_up <- cx_poly(sens_coords, 0.75, "+Y")
+  poly_06_down <- cx_poly(sens_coords, 0.6, "-Y")
+  poly_055_down <- cx_poly(sens_coords, 0.55, "-Y")
+  poly_03_up <- cx_poly(sens_coords, 0.3, "+Y")
+  poly_01_down <- cx_poly(sens_coords, 0.1, "-Y")
+
+  # top part medial (0.6 - 0.8)
+  top_med_ <- st_difference(fp_chull, poly_06_down)
+  top_med <- st_coordinates(st_difference(top_med_, poly_08_up))[, c(1, 2)]
+
+  # top part lateral (0.55 - 0.75)
+  top_lat_ <- st_difference(fp_chull, poly_075_up)
+  top_lat <- st_coordinates(st_difference(top_lat_, poly_055_down))[, c(1, 2)]
+
+  # bottom part (0.1 - 0.3)
+  bot_ <- st_difference(fp_chull, poly_03_up)
+  bot <- st_coordinates(st_difference(bot_, poly_01_down))[, c(1, 2)]
+
+  # rotate coords
+  top_med_rot <- rot_pts(top_med, foot_ang)
+  top_lat_rot <- rot_pts(top_lat, foot_ang)
+  bot_rot <- rot_pts(bot, foot_ang)
+
+  # find extremes
   if (side == "RIGHT") {
-    x <- med_edge
-    med_edge <- lat_edge
-    lat_edge <- x
+    ff_med <- rot_pts(top_med_rot[which.min(top_med_rot[, 1]), ], foot_ang * -1)
+    ff_lat <- rot_pts(top_lat_rot[which.max(top_lat_rot[, 1]), ], foot_ang * -1)
+    heel_med <- rot_pts(bot_rot[which.min(bot_rot[, 1]), ], foot_ang * -1)
+    heel_lat <- rot_pts(bot_rot[which.max(bot_rot[, 1]), ], foot_ang * -1)
+  }
+  if (side == "LEFT") {
+    ff_med <- rot_pts(top_med_rot[which.max(top_med_rot[, 1]), ], foot_ang * -1)
+    ff_lat <- rot_pts(top_lat_rot[which.min(top_lat_rot[, 1]), ], foot_ang * -1)
+    heel_med <- rot_pts(bot_rot[which.max(bot_rot[, 1]), ], foot_ang * -1)
+    heel_lat <- rot_pts(bot_rot[which.min(bot_rot[, 1]), ], foot_ang * -1)
   }
 
-  ### convex hulls of edges
-  med_edge_sf <- med_edge %>% st_as_sf(coords = c("x", "y"))
-  med_edge_chull <- st_convex_hull(st_combine(med_edge_sf))
-  lat_edge_sf <- lat_edge %>% st_as_sf(coords = c("x", "y"))
-  lat_edge_chull <- st_convex_hull(st_combine(lat_edge_sf))
-
-  ## longest med and lateral edge line
-  me_dis <- as.matrix(dist(st_coordinates(med_edge_chull)))
-  me_dis <- me_dis[row(me_dis) == (col(me_dis) - 1)]
-  me_max <- order(me_dis)[length(me_dis)]
-  med_side <- st_coordinates(med_edge_chull)[c(me_max, me_max + 1), c(1, 2)]
-  med_side_line <- st_linestring(med_side)
-  med_side_line <- st_extend_line(med_side_line, 2)
-  le_dis <- as.matrix(dist(st_coordinates(lat_edge_chull)))
-  le_dis <- le_dis[row(le_dis) == (col(le_dis) - 1)]
-  le_max <- order(le_dis)[length(le_dis) - 1]
-  lat_side <- st_coordinates(lat_edge_chull)[c(le_max, le_max + 1), c(1, 2)]
-  lat_side_line <- st_linestring(lat_side)
-  lat_side_line <- st_extend_line(lat_side_line, 2)
-
-  # check that no points fall outside of line
-  if (side == "RIGHT") {
-    med_poly <- st_line2polygon(med_side_line, 1, "-X")  + c(-0.001, 0)
-    lat_poly <- st_line2polygon(lat_side_line, 1, "+X")  + c(0.001, 0)
-  }
-  #med_int <- st_intersects(st_as_sfc(med_edge_sf), med_poly)
-  #lat_int <- st_intersects(st_as_sfc(lat_edge_sf), lat_poly)
-
-  # if points do fall in poly, use fitted line approach
+  # lines
+  med_side_line_ <- st_linestring(rbind(heel_med, ff_med))
+  med_side_line <- st_extend_line(med_side_line_, 3)
+  lat_side_line_ <- st_linestring(rbind(heel_lat, ff_lat))
+  lat_side_line <- st_extend_line(lat_side_line_, 3)
 
   # return lines
   return(list(med_side_line, lat_side_line))
+}
+
+
+#' poly as a percentage of min bbox
+#' @noRd
+
+cx_poly <- function(sens_coords, perc, direction) {
+  # bounding box
+  sens_coords_m <- as.matrix(sens_coords)
+  mbb <- getMinBBox(sens_coords_m)
+
+  ## Bounding box sides
+  side1 <- mbb[c(1:2), ]
+  side2 <- mbb[c(3:4), ]
+
+  ## Get crossing lines
+  side1_ <- side1[1, ] + ((side1[2, ] - side1[1, ]) * perc)
+  side2_ <- side2[1, ] + ((side2[2, ] - side2[1, ]) * perc)
+  line_ <- st_linestring(as.matrix(rbind(side1_, side2_)))
+  line_ <- st_coordinates(st_extend_line(line_, 1))[, c(1:2)]
+  poly <- st_line2polygon(line_[c(1, nrow(line_)), ], 1, direction)
+
+  # return
+  return(poly)
 }
 
 
@@ -3222,6 +3355,109 @@ rot_pts <- function (pts, ang) {
   return(new_pts)
 }
 
+
+#' @title icp mask
+#' @description match two landmark configurations using iteratively closest
+#' point search
+#' @param x moving landmarks
+#' @param y target landmarks
+#' @param iterations integer: number of iterations
+#' @param mindist restrict valid points to be within this distance
+#' @param subsample use a subsample determined by kmean clusters to speed up
+#' computation
+#' @param type character: select the transform to be applied, can be "rigid",
+#' "similarity" or "affine"
+#' @param weights vector of length \code{nrow(x)} containing weights for each
+#' row in \code{x}
+#' @param centerweight logical: if weights are defined and centerweigths=TRUE,
+#' the matrix will be centered according to these weights instead of the
+#' barycenter.
+#' @param threads integer: number of threads to use.
+#' @return returns the rotated landmarks
+#' @importFrom Rvcg vcgKDtree vcgSearchKDtree vcgCreateKDtree
+#' @importFrom Morpho computeTransform applyTransform
+#' @noRd
+icp_mask <- function(x, y, mask_list, iterations = 100, mindist = 1e15,
+                type = "similarity", threads = 1, centerweight = FALSE) {
+  # add column if 2D
+  m <- ncol(x)
+  if (m == 2) {
+    x <- cbind(x,0)
+    y <- cbind(y,0)
+  }
+
+  # type
+  type <- match.arg(type, c("rigid", "similarity", "affine"))
+
+  # temporary moving coords
+  xtmp <- x
+
+  # KD tree
+  yKD <- vcgCreateKDtree(y)
+
+  # iterate to find best fit
+  for (i in 1:iterations) {
+    clost <- vcgSearchKDtree(yKD, xtmp, 1, threads = threads)
+    good <- which(clost$distance < mindist)
+    trafo <- computeTransform(y[clost$index[good],], xtmp[good,], type = type,
+                              weights = NULL, centerweight = centerweight)
+    xtmp <- applyTransform(xtmp[,], trafo)
+  }
+
+  # final transform
+  fintrafo <- computeTransform(xtmp, x, type = type)
+
+  # transform mask coordinates
+  mask_t <- mask_list
+  for (i in 1:length(mask_list)) {
+    # mask
+    mask_crds <- st_coordinates(mask_list[[i]])[, c(1, 2)]
+    mask_crds <- cbind(mask_crds, 0)
+    mask_crds_t <- applyTransform(mask_crds, inverse = TRUE, fintrafo)
+    mask_crds_t <- rbind(mask_crds_t, mask_crds_t[nrow(mask_crds_t), ])
+    mask_t[[i]] <- st_polygon(list(mask_crds_t))
+  }
+
+  # return
+  return(mask_t)
+}
+
+
+#' @title Align mask
+#' @description Align mask, usually to trials from the same person
+#' @param pressure_data List. First item is a 3D array covering each timepoint
+#' of the measurement.
+#' @param mask List. List with masks to be transformed
+#' @return List.
+#' @importFrom sf st_coordinates st_polygon st_convex_hull
+#' @noRd
+align_mask <- function(pressure_data, masks) {
+  # get outline of pressure
+  outline_coords <- pressure_data$sens_polygons[, c(1, 2)] %>%
+    st_as_sf(coords = c("x", "y"))
+  outline_chull <- st_convex_hull(st_combine(outline_coords))
+  outline_coords_mat <- st_coordinates(outline_chull)[, c(1, 2)]
+
+  # align mask
+  mask_coords <- data.frame(x = double(), y = double())
+  for (i in 1:length(masks)) {
+    crds <- st_coordinates(masks[[i]])[, c(1, 2)]
+    mask_coords <- rbind(mask_coords, crds)
+  }
+  coords_df <- mask_coords %>%
+    st_as_sf(coords = c("X", "Y"))
+  fp_chull <- st_convex_hull(st_combine(coords_df))
+  mask_coords_mat <- st_coordinates(fp_chull)[, c(1, 2)]
+
+  # transform masks
+  masks_trans <- icp_mask(outline_coords_mat, mask_coords_mat, masks)
+
+  # return aligned mask
+  pressure_data[[5]] <- masks_trans
+  return(pressure_data)
+}
+
+
 #' @title Visualize masks
 #' @description Visualize the existing masks
 #' @param pressure_data List. First item is a 3D array covering each timepoint
@@ -3247,12 +3483,14 @@ plot_masks <- function(pressure_data,
   X <- Y <- NULL
 
   # initialize plot
-  grDevices::x11()
+  #grDevices::x11()
 
   if (pressure_data[[2]] != "pedar"){
+    x_max <- max(pressure_data[[7]]$x) + 0.01
+    y_max <- max(pressure_data[[7]]$y) + 0.01
     g <- plot_pressure(pressure_data, image, plot = FALSE)
-    g <- g + scale_x_continuous(expand = c(0, 0), limits = c(-0.01, 0.15))
-    g <- g + scale_y_continuous(expand = c(0, 0), limits = c(-0.01, 0.30))
+    g <- g + scale_x_continuous(expand = c(0, 0), limits = c(-0.01, x_max))
+    g <- g + scale_y_continuous(expand = c(0, 0), limits = c(-0.01, y_max))
   } else {
     if (image == "max"){
       g <- plot_pressure(pressure_data, variable = "max", plot = FALSE)
@@ -3262,7 +3500,7 @@ plot_masks <- function(pressure_data,
       stop("The variable image is invalid")
     }
   }
-  print(g)
+  #print(g)
 
   # plot original mask data
   for (n_mask in visual_list) {
@@ -3530,6 +3768,7 @@ sensor_centroid <- function(pressure_data) {
 #' @param pressure_data List. First item is a 3D array covering each timepoint
 #' of the measurement. z dimension represents time
 #' @param mask_scheme String.
+#' @param res_scale Numeric vector. Defines low cost functions for lines
 #' @param foot_side String. "RIGHT", "LEFT", or "auto". Auto uses
 #' auto_detect_side function
 #' @param plot Logical. Whether to play the animation
@@ -3544,10 +3783,10 @@ sensor_centroid <- function(pressure_data) {
 #'   \item events. List
 #'  }
 #' @importFrom zoo rollapply
-#' @importFrom sf st_union st_difference
+#' @importFrom sf st_union st_difference st_intersection
 #' @noRd
 
-automask <- function(pressure_data, mask_scheme, foot_side = "auto", res_scale,
+automask <- function(pressure_data, mask_scheme, res_scale, foot_side = "auto",
                      plot = TRUE) {
   # check data isn't from pedar
   if (pressure_data[[2]] == "pedar")
@@ -3576,9 +3815,9 @@ automask <- function(pressure_data, mask_scheme, foot_side = "auto", res_scale,
 
   # Define convex hull, expanding to include all sensors
   df_sf <- sens_coords %>%
-    st_as_sf(coords = c( "x", "y" ))
+    st_as_sf(coords = c("x", "y"))
   fp_chull <- st_convex_hull(st_union(df_sf))
-  fp_chull <- st_buffer(fp_chull, pressure_data[[3]][1])
+  fp_chull <- st_buffer(fp_chull, 0.0025)
 
   # Simple 3 mask (forefoot, midfoot, and hindfoot)
   ## Bounding box sides
@@ -3586,32 +3825,40 @@ automask <- function(pressure_data, mask_scheme, foot_side = "auto", res_scale,
   side2 <- mbb[c(3:4), ]
 
   ## Get distal 27% and 55% lines that divide into masks
+  ### heel
   side1_27 <- side1[1, ] + ((side1[2, ] - side1[1, ]) * 0.27)
   side2_27 <- side2[1, ] + ((side2[2, ] - side2[1, ]) * 0.27)
+  line_27 <- st_linestring(as.matrix(rbind(side1_27, side2_27)))
+  line_27 <- st_extend_line(line_27, 1)
+  line_27_ints <- st_coordinates(st_intersection(fp_chull, line_27))
+  heel_line <- shortest_path(max_df, 0, line_27_ints[1, c(1:2)],
+                             line_27_ints[2, c(1:2)], 0.005, 0.005,
+                             res_scale[1])
+  heel_line_dist_poly <- st_line2polygon(st_linestring(heel_line), 1, "+Y")
+  heel_line_prox_poly <- st_line2polygon(st_linestring(heel_line), 1, "-Y")
+
+  ### midfoot/forefoot
   side1_55 <- side1[1, ] + ((side1[2, ] - side1[1, ]) * 0.55)
   side2_55 <- side2[1, ] + ((side2[2, ] - side2[1, ]) * 0.55)
-  line_27_df <- rbind(side1_27, side2_27)
-  line_55_df <- rbind(side1_55, side2_55)
-  line_27 <- st_linestring(as.matrix(line_27_df))
-  line_27 <- st_extend_line(line_27, 1)
-  line_27_dist_poly <- st_line2polygon(line_27, 1, "+Y")
-  line_27_prox_poly <- st_line2polygon(line_27, 1, "-Y")
-  line_55 <- st_linestring(as.matrix(line_55_df))
+  line_55 <- st_linestring(as.matrix(rbind(side1_55, side2_55)))
   line_55 <- st_extend_line(line_55, 1)
-  line_55_dist_poly <- st_line2polygon(line_55, 1, "+Y")
-  line_55_prox_poly <- st_line2polygon(line_55, 1, "-Y")
+  line_55_ints <- st_coordinates(st_intersection(fp_chull, line_55))
+  midff_line <- shortest_path(max_df, 0, line_55_ints[1, c(1:2)],
+                              line_55_ints[2, c(1:2)], 0.005, 0.005,
+                              res_scale[2])
+  midff_line_dist_poly <- st_line2polygon(st_linestring(midff_line), 1, "+Y")
+  midff_line_prox_poly <- st_line2polygon(st_linestring(midff_line), 1, "-Y")
 
   ## forefoot, midfoot, and hindfoot masks
-  hf_mask <- st_difference(fp_chull, line_27_dist_poly)
-  mf_mask <- st_difference(fp_chull, line_55_dist_poly)
-  mf_mask <- st_difference(mf_mask, line_27_prox_poly)
-  ff_mask <- st_difference(fp_chull, line_55_prox_poly)
+  hf_mask <- st_difference(fp_chull, heel_line_dist_poly)
+  mf_mask <- st_difference(fp_chull, midff_line_dist_poly)
+  mf_mask <- st_difference(mf_mask, heel_line_prox_poly)
+  ff_mask <- st_difference(fp_chull, midff_line_prox_poly)
 
   # if more complex automask required
   if (mask_scheme == "automask_simple") {
     # Make mask list
-    mask_list <- list(heel_mask = hf_mask,
-                      midfoot_mask = mf_mask,
+    mask_list <- list(heel_mask = hf_mask, midfoot_mask = mf_mask,
                       forefoot_mask = ff_mask)
   } else if (mask_scheme == "automask_novel") {
     # Define angles for dividing lines between metatarsals
@@ -3637,28 +3884,16 @@ automask <- function(pressure_data, mask_scheme, foot_side = "auto", res_scale,
     MT_34_alpha <- (0.64 * alpha)
     MT_45_alpha <- (0.81 * alpha)
 
-    ## polys for met and hal cuts
-    if (side == "RIGHT") {lat_dir <- "+X"; med_dir <- "-X"}
-    if (side == "LEFT") {lat_dir <- "-X"; med_dir <- "+X"}
+    ## hallux and toe angle lines
     MT_hx_line <- rot_line(edges[[1]], MT_hx_alpha, med_lat_int)
-    MT_hx_poly_lat <- st_line2polygon(st_coordinates(MT_hx_line)[, 1:2], 1, lat_dir)
-    MT_hx_poly_med <- st_line2polygon(st_coordinates(MT_hx_line)[, 1:2], 1, med_dir)
     MT_12_line <- rot_line(edges[[1]], MT_12_alpha, med_lat_int)
-    MT_12_poly_lat <- st_line2polygon(st_coordinates(MT_12_line)[, 1:2], 1, lat_dir)
-    MT_12_poly_med <- st_line2polygon(st_coordinates(MT_12_line)[, 1:2], 1, med_dir)
     MT_23_line <- rot_line(edges[[1]], MT_23_alpha, med_lat_int)
-    MT_23_poly_lat <- st_line2polygon(st_coordinates(MT_23_line)[, 1:2], 1, lat_dir)
-    MT_23_poly_med <- st_line2polygon(st_coordinates(MT_23_line)[, 1:2], 1, med_dir)
     MT_34_line <- rot_line(edges[[1]], MT_34_alpha, med_lat_int)
-    MT_34_poly_lat <- st_line2polygon(st_coordinates(MT_34_line)[, 1:2], 1, lat_dir)
-    MT_34_poly_med <- st_line2polygon(st_coordinates(MT_34_line)[, 1:2], 1, med_dir)
     MT_45_line <- rot_line(edges[[1]], MT_45_alpha, med_lat_int)
-    MT_45_poly_lat <- st_line2polygon(st_coordinates(MT_45_line)[, 1:2], 1, lat_dir)
-    MT_45_poly_med <- st_line2polygon(st_coordinates(MT_45_line)[, 1:2], 1, med_dir)
 
     ## simplify toe line
     ### toe line
-    toe_line_mat <- toe_line(pressure_data, side, res_scale)
+    toe_line_mat <- toe_line(pressure_data, side, res_scale[3])
     HX_toe_pt <- st_intersection(st_linestring(toe_line_mat), MT_hx_line)
     MT12_toe_pt <- st_intersection(st_linestring(toe_line_mat), MT_12_line)
     MT23_toe_pt <- st_intersection(st_linestring(toe_line_mat), MT_23_line)
@@ -3668,13 +3903,38 @@ automask <- function(pressure_data, mask_scheme, foot_side = "auto", res_scale,
     toe_line_mat_simple <- rbind(MT5_toe_pt, MT45_toe_pt, MT34_toe_pt,
                                  MT23_toe_pt, HX_toe_pt, MT12_toe_pt)
     if (side == "LEFT") {
-      toe_line_mat_simple <- rbind(toe_line_mat[nrow(toe_line_mat), ], toe_line_mat_simple,
-                                   toe_line_mat[1, ])
+      toe_line_mat_simple <- rbind(toe_line_mat[nrow(toe_line_mat), ],
+                                   toe_line_mat_simple, toe_line_mat[1, ])
     }
     if (side == "RIGHT") {
       toe_line_mat_simple <- rbind(toe_line_mat[nrow(toe_line_mat), ],
                                    toe_line_mat_simple, toe_line_mat[1, ])
     }
+
+    ## hallux line
+    hx_int_top <- st_coordinates(st_intersection(fp_chull, MT_hx_line))
+    hx_int_top_ <- unname(hx_int_top[which.max(hx_int_top[, 2]), c(1, 2)])
+    hx_int_top_[2] <- hx_int_top_[2] - 0.003
+    HX_toe_pt_ <- c(st_coordinates(HX_toe_pt))
+    hx_l <- shortest_path(max_df, 0, HX_toe_pt_,
+                          hx_int_top_, 0.005, 0.005, res_scale[4],
+                          extend_line = FALSE)
+    hx_line <- rbind(c(hx_l[1, 1], hx_l[1, 2] - 1), hx_l,
+                     c(hx_l[nrow(hx_l), 1], hx_l[nrow(hx_l), 2] + 1))
+
+    ## polys for met and hal cuts
+    if (side == "RIGHT") {lat <- "+X"; med <- "-X"}
+    if (side == "LEFT") {lat <- "-X"; med <- "+X"}
+    MT_hx_poly_lat <- st_line2polygon(hx_line, 1, lat)
+    MT_hx_poly_med <- st_line2polygon(hx_line, 1, med)
+    MT_12_poly_lat <- st_line2polygon(st_coordinates(MT_12_line)[, 1:2], 1, lat)
+    MT_12_poly_med <- st_line2polygon(st_coordinates(MT_12_line)[, 1:2], 1, med)
+    MT_23_poly_lat <- st_line2polygon(st_coordinates(MT_23_line)[, 1:2], 1, lat)
+    MT_23_poly_med <- st_line2polygon(st_coordinates(MT_23_line)[, 1:2], 1, med)
+    MT_34_poly_lat <- st_line2polygon(st_coordinates(MT_34_line)[, 1:2], 1, lat)
+    MT_34_poly_med <- st_line2polygon(st_coordinates(MT_34_line)[, 1:2], 1, med)
+    MT_45_poly_lat <- st_line2polygon(st_coordinates(MT_45_line)[, 1:2], 1, lat)
+    MT_45_poly_med <- st_line2polygon(st_coordinates(MT_45_line)[, 1:2], 1, med)
 
     ## toe cut polygons
     toe_poly_prox <- st_line2polygon(as.matrix(toe_line_mat_simple), 1, "-Y")
@@ -3715,9 +3975,11 @@ automask <- function(pressure_data, mask_scheme, foot_side = "auto", res_scale,
     mask_df <- masks_2_df(mask_list)
 
     # Plot footprint and masks
+    x_max <- max(pressure_data[[7]]$x) + 0.01
+    y_max <- max(pressure_data[[7]]$y) + 0.01
     g <- plot_pressure(pressure_data, "max", plot = FALSE)
-    g <- g + scale_x_continuous(expand = c(0, 0), limits = c(-0.01, 0.15))
-    g <- g + scale_y_continuous(expand = c(0, 0), limits = c(-0.01, 0.30))
+    g <- g + scale_x_continuous(expand = c(0, 0), limits = c(-0.01, x_max))
+    g <- g + scale_y_continuous(expand = c(0, 0), limits = c(-0.01, y_max))
     g <- g + geom_path(data = mask_df, aes(x = x, y = y, group = mask),
                        color = "red", linewidth = 1)
     suppressMessages(print(g))
@@ -3933,15 +4195,19 @@ pedar_mask3 <- function(pressure_data) {
   hallux_L <- pedar_polygon(pressure_data, c(83:84, 90:91, 96))
   lesser_toes_L <- pedar_polygon(pressure_data, c(81:82, 85:89, 92:95, 97:99))
 
-  med_rf_R <- pedar_polygon(pressure_data, c(100:101, 105:107, 112:114, 119:121))
+  med_rf_R <- pedar_polygon(pressure_data, c(100:101, 105:107, 112:114,
+                                             119:121))
   lat_rf_R <-pedar_polygon(pressure_data, c(108:111, 115:118, 122:125))
-  med_mf_R <- pedar_polygon(pressure_data, c(126:128, 133:135, 140:142, 147:149, 154:156))
-  lat_mf_R <- pedar_polygon(pressure_data, c(129:132, 136:139, 143:146, 150:153, 157:158))
+  med_mf_R <- pedar_polygon(pressure_data, c(126:128, 133:135, 140:142, 147:149,
+                                             154:156))
+  lat_mf_R <- pedar_polygon(pressure_data, c(129:132, 136:139, 143:146, 150:153,
+                                             157:158))
   MTPJ1_R <- pedar_polygon(pressure_data, c(161, 162, 168, 169, 175, 176))
   MTPJ23_R <- pedar_polygon(pressure_data, c(163:165, 170:172, 177:179))
   MTPJ45_R <- pedar_polygon(pressure_data, c(159, 160, 166, 167, 173, 174))
   hallux_R <- pedar_polygon(pressure_data, c(182, 183, 189, 190, 195))
-  lesser_toes_R <- pedar_polygon(pressure_data, c(180:181, 184:188, 191:194, 196:198))
+  lesser_toes_R <- pedar_polygon(pressure_data, c(180:181, 184:188, 191:194,
+                                                  196:198))
 
   mask_list <- list(L_medial_hindfoot_mask = med_rf_L,
                     L_lateral_hindfoot_mask = lat_rf_L,
@@ -4018,394 +4284,251 @@ dpli <- function(pressure_data_, pressure_data, sens_mask_df, mask,
 
 # data
 pedar_insole_area <- function() {
-  pedar_insole_areas <- data.frame(u = c(126, 129, 129, 129, 129, 126, 126, 125,
-                                         126, 126, 126, 126, 129, 129, 129, 129,
-                                         129, 129, 129, 126, 126, 127, 126, 126,
-                                         126, 127, 127, 127, 128, 127, 127, 127,
-                                         127, 131, 130, 131, 130, 131, 131, 130,
-                                         126, 126, 125, 126, 126, 126, 126, 126,
-                                         126, 125, 126, 126, 126, 126, 129, 129,
-                                         129, 129, 129, 129, 128, 127, 127, 128,
-                                         127, 127, 127, 127, 129, 129, 130, 129,
-                                         129, 129, 129, 128, 127, 128, 127, 128,
-                                         127, 128, 126, 126, 126, 126, 126, 125,
-                                         126, 123, 122, 123, 123, 123, 123, 126,
-                                         126, 127, 127),
-                                   v = c(139, 143, 143, 142, 143, 139, 139, 139,
-                                         139, 139, 139, 139, 143, 143, 143, 143,
-                                         143, 143, 143, 139, 139, 139, 139, 139,
-                                         139, 139, 141, 141, 141, 141, 141, 141,
-                                         141, 144, 144, 144, 144, 144, 144, 144,
-                                         139, 139, 139, 139, 139, 139, 139, 140,
-                                         140, 140, 140, 140, 140, 140, 143, 143,
-                                         143, 143, 143, 143, 143, 140, 140, 140,
-                                         140, 140, 140, 140, 144, 144, 144, 144,
-                                         144, 144, 144, 141, 141, 141, 141, 141,
-                                         141, 141, 139, 139, 139, 139, 139, 139,
-                                         139, 136, 136, 136, 136, 136, 136, 140,
-                                         140, 141, 140),
-                                   w = c(155, 160, 159, 159, 159, 155, 155, 155,
-                                         155, 156, 155, 155, 158, 160, 158, 158,
-                                         160, 158, 160, 155, 156, 155, 155, 156,
-                                         154, 156, 158, 159, 158, 159, 158, 158,
-                                         158, 160, 161, 160, 161, 160, 161, 160,
-                                         155, 155, 155, 155, 155, 155, 155, 157,
-                                         157, 156, 157, 157, 157, 157, 158, 159,
-                                         158, 159, 159, 159, 159, 156, 157, 158,
-                                         157, 157, 157, 157, 160, 159, 160, 160,
-                                         159, 160, 159, 159, 158, 158, 158, 158,
-                                         158, 158, 155, 155, 155, 155, 155, 155,
-                                         155, 151, 152, 151, 151, 151, 151, 156,
-                                         156, 157, 156),
-                                   x = c(172, 176, 176, 176, 176, 172, 172, 172,
-                                         172, 172, 172, 172, 176, 176, 176, 176,
-                                         176, 176, 176, 172, 172, 172, 172, 172,
-                                         172, 172, 175, 175, 175, 175, 175, 175,
-                                         175, 178, 178, 178, 178, 178, 178, 178,
-                                         172, 172, 172, 172, 172, 172, 172, 173,
-                                         173, 173, 173, 173, 173, 173, 176, 176,
-                                         176, 176, 176, 176, 176, 173, 173, 173,
-                                         173, 173, 173, 173, 178, 178, 178, 178,
-                                         178, 178, 178, 174, 174, 174, 174, 174,
-                                         174, 174, 171, 171, 171, 171, 171, 171,
-                                         171, 168, 168, 168, 168, 168, 168, 173,
-                                         173, 174, 174),
-                                   y = c(192, 195, 197, 197, 196, 191, 191, 191,
-                                         191, 191, 192, 191, 196, 196, 196, 196,
-                                         196, 197, 195, 192, 190, 189, 192, 191,
-                                         191, 189, 195, 193, 194, 195, 194, 195,
-                                         193, 197, 197, 197, 197, 197, 199, 196,
-                                         191, 191, 190, 191, 191, 191, 190, 192,
-                                         192, 192, 192, 191, 192, 192, 196, 196,
-                                         196, 196, 196, 196, 196, 191, 193, 192,
-                                         191, 193, 192, 192, 197, 198, 197, 197,
-                                         197, 197, 198, 195, 194, 194, 194, 193,
-                                         194, 194, 191, 190, 191, 190, 191, 190,
-                                         190, 187, 186, 187, 186, 187, 186, 192,
-                                         191, 193, 192),
-                                   z = c(214, 221, 220, 221, 219, 213, 216, 216,
-                                         213, 216, 214, 214, 219, 220, 220, 218,
-                                         220, 220, 219, 215, 214, 215, 213, 215,
-                                         214, 215, 219, 217, 219, 217, 218, 217,
-                                         219, 222, 223, 223, 222, 223, 222, 223,
-                                         214, 215, 214, 214, 215, 214, 215, 216,
-                                         216, 215, 217, 216, 216, 216, 219, 218,
-                                         219, 219, 219, 218, 219, 217, 216, 217,
-                                         216, 218, 216, 217, 221, 222, 221, 222,
-                                         222, 221, 222, 218, 219, 218, 219, 218,
-                                         218, 219, 214, 214, 214, 214, 214, 214,
-                                         214, 209, 208, 208, 208, 208, 209, 215,
-                                         216, 217, 217),
-                                   uw = c(114, 101, 107, 101, 114, 103, 115, 114,
-                                          115, 114, 113, 105, 121, 123, 122, 122,
-                                          122, 121, 123, 127, 129, 128, 127, 128,
-                                          128, 128, 135, 136, 136, 135, 136, 137,
-                                          135, 141, 142, 141, 142, 141, 143, 141,
-                                          149, 150, 149, 150, 149, 150, 148, 155,
-                                          155, 156, 155, 155, 156, 154, 156, 159,
-                                          162, 162, 164, 167, 167, 160, 164, 165,
-                                          168, 171, 173, 174, 163, 166, 167, 170,
-                                          170, 173, 176, 158, 160, 162, 164, 165,
-                                          170, 170, 137, 147, 148, 150, 151, 154,
-                                          155, 210, 132, 133, 135, 248, 67, 98,
-                                          110, 108, 104),
-                                   xw = c(158, 140, 149, 140, 158, 145, 158, 158,
-                                          159, 158, 158, 145, 170, 168, 169, 169,
-                                          169, 168, 170, 179, 177, 179, 178, 179,
-                                          177, 179, 188, 187, 188, 187, 188, 187,
-                                          188, 196, 196, 196, 195, 196, 196, 196,
-                                          207, 206, 206, 207, 206, 206, 207, 217,
-                                          215, 216, 216, 216, 215, 217, 233, 229,
-                                          229, 225, 222, 218, 218, 242, 238, 235,
-                                          233, 230, 226, 224, 242, 240, 238, 235,
-                                          232, 229, 226, 235, 234, 230, 227, 224,
-                                          222, 218, 216, 213, 210, 208, 206, 205,
-                                          189, 343, 186, 185, 182, 290, 144, 149,
-                                          154, 134, 93),
-                                   vw = c(128, 113, 120, 113, 128, 117, 129, 127,
-                                          128, 129, 127, 117, 136, 137, 136, 136,
-                                          137, 136, 136, 144, 144, 143, 144, 144,
-                                          143, 144, 152, 153, 151, 152, 153, 151,
-                                          152, 158, 159, 158, 158, 159, 158, 158,
-                                          168, 168, 167, 168, 168, 167, 168, 175,
-                                          176, 174, 175, 176, 174, 175, 188, 186,
-                                          183, 181, 180, 177, 175, 196, 193, 191,
-                                          189, 187, 184, 181, 197, 195, 193, 190,
-                                          187, 185, 183, 190, 189, 186, 183, 182,
-                                          181, 177, 175, 172, 170, 169, 167, 165,
-                                          153, 276, 152, 149, 147, 235, 116, 122,
-                                          124, 109, 76))
+  pedar_insole_areas <- data.frame(
+    a = c(239, 246, 246, 247, 245, 238, 241, 241, 238, 241, 239, 239, 245, 246,
+          246, 243, 246, 246, 245, 240, 239, 240, 238, 240, 239, 240, 244, 243,
+          244, 243, 244, 234, 244, 248, 249, 249, 248, 249, 248, 249, 239, 240,
+          239, 239, 240, 239, 240, 241, 241, 240, 242, 241, 241, 241, 245, 244,
+          245, 245, 245, 244, 245, 242, 241, 242, 241, 244, 241, 242, 246, 247,
+          246, 247, 247, 246, 247, 243, 245, 244, 244, 244, 244, 245, 239, 239,
+          239, 239, 239, 239, 239, 234, 233, 232, 232, 232, 234, 240, 241, 243,
+          242),
+    u = c(126, 129, 129, 129, 129, 126, 126, 125, 126, 126, 126, 126, 129, 129,
+          129, 129, 129, 129, 129, 126, 126, 127, 126, 126, 126, 127, 127, 127,
+          128, 127, 127, 127, 127, 131, 130, 131, 130, 131, 131, 130, 126, 126,
+          125, 126, 126, 126, 126, 126, 126, 125, 126, 126, 126, 126, 129, 129,
+          129, 129, 129, 129, 128, 127, 127, 128, 127, 127, 127, 127, 129, 129,
+          130, 129, 129, 129, 129, 128, 127, 128, 127, 128, 127, 128, 126, 126,
+          126, 126, 126, 125, 126, 123, 122, 123, 123, 123, 123, 126, 126, 127,
+          127),
+    v = c(139, 143, 143, 142, 143, 139, 139, 139, 139, 139, 139, 139, 143, 143,
+          143, 143, 143, 143, 143, 139, 139, 139, 139, 139, 139, 139, 141, 141,
+          141, 141, 141, 141, 141, 144, 144, 144, 144, 144, 144, 144, 139, 139,
+          139, 139, 139, 139, 139, 140, 140, 140, 140, 140, 140, 140, 143, 143,
+          143, 143, 143, 143, 143, 140, 140, 140, 140, 140, 140, 140, 144, 144,
+          144, 144, 144, 144, 144, 141, 141, 141, 141, 141, 141, 141, 139, 139,
+          139, 139, 139, 139, 139, 136, 136, 136, 136, 136, 136, 140, 140, 141,
+          140),
+    w = c(155, 160, 159, 159, 159, 155, 155, 155, 155, 156, 155, 155, 158, 160,
+          158, 158, 160, 158, 160, 155, 156, 155, 155, 156, 154, 156, 158, 159,
+          158, 159, 158, 158, 158, 160, 161, 160, 161, 160, 161, 160, 155, 155,
+          155, 155, 155, 155, 155, 157, 157, 156, 157, 157, 157, 157, 158, 159,
+          158, 159, 159, 159, 159, 156, 157, 158, 157, 157, 157, 157, 160, 159,
+          160, 160, 159, 160, 159, 159, 158, 158, 158, 158, 158, 158, 155, 155,
+          155, 155, 155, 155, 155, 151, 152, 151, 151, 151, 151, 156, 156, 157,
+          156),
+    x = c(172, 176, 176, 176, 176, 172, 172, 172, 172, 172, 172, 172, 176, 176,
+          176, 176, 176, 176, 176, 172, 172, 172, 172, 172, 172, 172, 175, 175,
+          175, 175, 175, 175, 175, 178, 178, 178, 178, 178, 178, 178, 172, 172,
+          172, 172, 172, 172, 172, 173, 173, 173, 173, 173, 173, 173, 176, 176,
+          176, 176, 176, 176, 176, 173, 173, 173, 173, 173, 173, 173, 178, 178,
+          178, 178, 178, 178, 178, 174, 174, 174, 174, 174, 174, 174, 171, 171,
+          171, 171, 171, 171, 171, 168, 168, 168, 168, 168, 168, 173, 173, 174,
+          174),
+    y = c(192, 195, 197, 197, 196, 191, 191, 191, 191, 191, 192, 191, 196, 196,
+          196, 196, 196, 197, 195, 192, 190, 189, 192, 191, 191, 189, 195, 193,
+          194, 195, 194, 195, 193, 197, 197, 197, 197, 197, 199, 196, 191, 191,
+          190, 191, 191, 191, 190, 192, 192, 192, 192, 191, 192, 192, 196, 196,
+          196, 196, 196, 196, 196, 191, 193, 192, 191, 193, 192, 192, 197, 198,
+          197, 197, 197, 197, 198, 195, 194, 194, 194, 193, 194, 194, 191, 190,
+          191, 190, 191, 190, 190, 187, 186, 187, 186, 187, 186, 192, 191, 193,
+          192),
+    z = c(214, 221, 220, 221, 219, 213, 216, 216, 213, 216, 214, 214, 219, 220,
+          220, 218, 220, 220, 219, 215, 214, 215, 213, 215, 214, 215, 219, 217,
+          219, 217, 218, 217, 219, 222, 223, 223, 222, 223, 222, 223, 214, 215,
+          214, 214, 215, 214, 215, 216, 216, 215, 217, 216, 216, 216, 219, 218,
+          219, 219, 219, 218, 219, 217, 216, 217, 216, 218, 216, 217, 221, 222,
+          221, 222, 222, 221, 222, 218, 219, 218, 219, 218, 218, 219, 214, 214,
+          214, 214, 214, 214, 214, 209, 208, 208, 208, 208, 209, 215, 216, 217,
+          217),
+    uw = c(114, 101, 107, 101, 114, 103, 115, 114, 115, 114, 113, 105, 121, 123,
+           122, 122, 122, 121, 123, 127, 129, 128, 127, 128, 128, 128, 135, 136,
+           136, 135, 136, 137, 135, 141, 142, 141, 142, 141, 143, 141, 149, 150,
+           149, 150, 149, 150, 148, 155, 155, 156, 155, 155, 156, 154, 156, 159,
+           162, 162, 164, 167, 167, 160, 164, 165, 168, 171, 173, 174, 163, 166,
+           167, 170, 170, 173, 176, 158, 160, 162, 164, 165, 170, 170, 137, 147,
+           148, 150, 151, 154, 155, 210, 132, 133, 135, 248, 67, 98, 110, 108,
+           104),
+    xw = c(158, 140, 149, 140, 158, 145, 158, 158, 159, 158, 158, 145, 170, 168,
+           169, 169, 169, 168, 170, 179, 177, 179, 178, 179, 177, 179, 188, 187,
+           188, 187, 188, 187, 188, 196, 196, 196, 195, 196, 196, 196, 207, 206,
+           206, 207, 206, 206, 207, 217, 215, 216, 216, 216, 215, 217, 233, 229,
+           229, 225, 222, 218, 218, 242, 238, 235, 233, 230, 226, 224, 242, 240,
+           238, 235, 232, 229, 226, 235, 234, 230, 227, 224, 222, 218, 216, 213,
+           210, 208, 206, 205, 189, 343, 186, 185, 182, 290, 144, 149, 154, 134,
+           93),
+    vw = c(128, 113, 120, 113, 128, 117, 129, 127, 128, 129, 127, 117, 136, 137,
+           136, 136, 137, 136, 136, 144, 144, 143, 144, 144, 143, 144, 152, 153,
+           151, 152, 153, 151, 152, 158, 159, 158, 158, 159, 158, 158, 168, 168,
+           167, 168, 168, 167, 168, 175, 176, 174, 175, 176, 174, 175, 188, 186,
+           183, 181, 180, 177, 175, 196, 193, 191, 189, 187, 184, 181, 197, 195,
+           193, 190, 187, 185, 183, 190, 189, 186, 183, 182, 181, 177, 175, 172,
+           170, 169, 167, 165, 153, 276, 152, 149, 147, 235, 116, 122, 124, 109,
+           76))
   return(pedar_insole_areas)
 }
 
 pedar_insole_grids <- function() {
-  pedar_insole_grid <- data.frame(V1 = c(0.643, 0.671, 0.696, 0.726, 0.778, 0.608,
-                                         0.636, 0.664, 0.696, 0.726, 0.758, 0.786,
-                                         0.604, 0.632, 0.664, 0.696, 0.728, 0.758,
-                                         0.788, 0.6, 0.632, 0.664, 0.692, 0.724,
-                                         0.758, 0.79, 0.596, 0.628, 0.66, 0.692,
-                                         0.726, 0.758, 0.79, 0.592, 0.624, 0.656,
-                                         0.692, 0.726, 0.758, 0.79, 0.588, 0.62,
-                                         0.656, 0.688, 0.722, 0.758, 0.79, 0.568,
-                                         0.604, 0.64, 0.676, 0.714, 0.754, 0.79,
-                                         0.552, 0.592, 0.632, 0.672, 0.71, 0.75,
-                                         0.79, 0.546, 0.584, 0.624, 0.664, 0.71,
-                                         0.75, 0.79, 0.536, 0.576, 0.62, 0.66,
-                                         0.702, 0.742, 0.782, 0.536, 0.572, 0.612,
-                                         0.652, 0.692, 0.728, 0.77, 0.536, 0.572,
-                                         0.608, 0.64, 0.676, 0.714, 0.744, 0.554,
-                                         0.584, 0.616, 0.652, 0.684, 0.708, 0.572,
-                                         0.604, 0.636, 0.68, 0.157, 0.129, 0.104,
-                                         0.074, 0.022, 0.192, 0.164, 0.136, 0.104,
-                                         0.074, 0.042, 0.014, 0.196, 0.168, 0.136,
-                                         0.104, 0.072, 0.042, 0.012, 0.2,
-                                         0.168, 0.136, 0.108, 0.076, 0.042, 0.01,
-                                         0.204, 0.172, 0.14, 0.108, 0.074, 0.042,
-                                         0.01, 0.208, 0.176, 0.144, 0.108, 0.074,
-                                         0.042, 0.01, 0.212, 0.18, 0.144, 0.112,
-                                         0.078, 0.042, 0.01, 0.232, 0.196, 0.16,
-                                         0.124, 0.086, 0.046, 0.01, 0.248, 0.208,
-                                         0.168, 0.128, 0.09, 0.05, 0.01, 0.254,
-                                         0.216, 0.176, 0.136, 0.09, 0.05, 0.01,
-                                         0.264, 0.224, 0.18, 0.14, 0.098, 0.058,
-                                         0.018, 0.264, 0.228, 0.188, 0.148, 0.108,
-                                         0.072, 0.03, 0.264, 0.228, 0.192, 0.16,
-                                         0.124, 0.086, 0.056, 0.246, 0.216, 0.184,
-                                         0.148, 0.116, 0.092, 0.228, 0.196, 0.164,
-                                         0.12),
-                                  V2 = c(0.154, 0.154, 0.154, 0.154, 0.154, 0.227,
-                                         0.227, 0.227, 0.227, 0.227, 0.227, 0.227,
-                                         0.295, 0.295, 0.295, 0.295, 0.295, 0.295,
-                                         0.295, 0.36, 0.36, 0.36, 0.36, 0.36,
-                                         0.36, 0.36, 0.424, 0.424, 0.424, 0.424,
-                                         0.424, 0.424, 0.424, 0.492, 0.492, 0.492,
-                                         0.492, 0.492, 0.492, 0.492, 0.552, 0.552,
-                                         0.552, 0.552, 0.552, 0.552, 0.552, 0.612,
-                                         0.612, 0.612, 0.612, 0.612, 0.612, 0.612,
-                                         0.664, 0.664, 0.664, 0.664, 0.664, 0.664,
-                                         0.664, 0.716, 0.716, 0.716, 0.716, 0.716,
-                                         0.716, 0.716, 0.77, 0.77, 0.77, 0.77,
-                                         0.77, 0.77, 0.77, 0.822, 0.822, 0.822,
-                                         0.822, 0.822, 0.822, 0.822, 0.878, 0.878,
-                                         0.878, 0.878, 0.878, 0.878, 0.878, 0.931,
-                                         0.931, 0.931, 0.931, 0.931, 0.931, 0.99,
-                                         0.995, 0.99, 0.967, 0.154, 0.154,
-                                         0.154, 0.154, 0.154, 0.227, 0.227, 0.227,
-                                         0.227, 0.227, 0.227, 0.227, 0.295, 0.295,
-                                         0.295, 0.295, 0.295, 0.295, 0.295, 0.36,
-                                         0.36, 0.36, 0.36, 0.36, 0.36, 0.36,
-                                         0.424, 0.424, 0.424, 0.424, 0.424, 0.424,
-                                         0.424, 0.492, 0.492, 0.492, 0.492, 0.492,
-                                         0.492, 0.492, 0.552, 0.552, 0.552, 0.552,
-                                         0.552, 0.552, 0.552, 0.612, 0.612, 0.612,
-                                         0.612, 0.612, 0.612, 0.612, 0.664, 0.664,
-                                         0.664, 0.664, 0.664, 0.664, 0.664, 0.716,
-                                         0.716, 0.716, 0.716, 0.716, 0.716, 0.716,
-                                         0.77, 0.77, 0.77, 0.77, 0.77, 0.77, 0.77,
-                                         0.822, 0.822, 0.822, 0.822, 0.822, 0.822,
-                                         0.822, 0.878, 0.878, 0.878, 0.878, 0.878,
-                                         0.878, 0.878, 0.931, 0.931, 0.931, 0.931,
-                                         0.931, 0.931, 0.99, 0.995, 0.99, 0.967),
-                                  V3 = c(0.592, 0.643, 0.671, 0.696, 0.726, 0.575,
-                                         0.608, 0.636, 0.664, 0.696, 0.726, 0.758,
-                                         0.572, 0.604, 0.632, 0.664, 0.696, 0.728,
-                                         0.758, 0.568, 0.6, 0.632, 0.664, 0.692,
-                                         0.724, 0.758, 0.564, 0.596, 0.628, 0.66,
-                                         0.692, 0.726, 0.758, 0.56, 0.592, 0.624,
-                                         0.656, 0.692, 0.726, 0.758, 0.556, 0.588,
-                                         0.62, 0.656, 0.688, 0.722, 0.758, 0.532,
-                                         0.568, 0.604, 0.64, 0.676, 0.714, 0.754,
-                                         0.518, 0.552, 0.592, 0.632, 0.672, 0.71,
-                                         0.75, 0.504, 0.546, 0.584, 0.624, 0.664,
-                                         0.71, 0.75, 0.495, 0.536, 0.576, 0.62,
-                                         0.66, 0.702, 0.742, 0.495, 0.536, 0.572,
-                                         0.612, 0.652, 0.692, 0.728, 0.503, 0.536,
-                                         0.572, 0.608, 0.64, 0.676, 0.714, 0.52,
-                                         0.554, 0.584, 0.616, 0.652, 0.684, 0.544,
-                                         0.572, 0.604, 0.636, 0.208, 0.157,
-                                         0.129, 0.104, 0.074, 0.225, 0.192, 0.164,
-                                         0.136, 0.104, 0.074, 0.042, 0.228, 0.196,
-                                         0.168, 0.136, 0.104, 0.072, 0.042, 0.232,
-                                         0.2, 0.168, 0.136, 0.108, 0.076, 0.042,
-                                         0.236, 0.204, 0.172, 0.14, 0.108, 0.074,
-                                         0.042, 0.24, 0.208, 0.176, 0.144, 0.108,
-                                         0.074, 0.042, 0.244, 0.212, 0.18, 0.144,
-                                         0.112, 0.078, 0.042, 0.268, 0.232, 0.196,
-                                         0.16, 0.124, 0.086, 0.046, 0.282, 0.248,
-                                         0.208, 0.168, 0.128, 0.09, 0.05, 0.296,
-                                         0.254, 0.216, 0.176, 0.136, 0.09, 0.05,
-                                         0.305, 0.264, 0.224, 0.18, 0.14, 0.098,
-                                         0.058, 0.305, 0.264, 0.228, 0.188, 0.148,
-                                         0.108, 0.072, 0.297, 0.264, 0.228, 0.192,
-                                         0.16, 0.124, 0.086, 0.28, 0.246, 0.216,
-                                         0.184, 0.148, 0.116, 0.256, 0.228, 0.196,
-                                         0.164),
-                                  V4 = c(0.154, 0.154, 0.154, 0.154, 0.154, 0.227,
-                                         0.227, 0.227, 0.227, 0.227, 0.227, 0.227,
-                                         0.295, 0.295, 0.295, 0.295, 0.295, 0.295,
-                                         0.295, 0.36, 0.36, 0.36, 0.36, 0.36,
-                                         0.36, 0.36, 0.424, 0.424, 0.424, 0.424,
-                                         0.424, 0.424, 0.424, 0.492, 0.492, 0.492,
-                                         0.492, 0.492, 0.492, 0.492, 0.552, 0.552,
-                                         0.552, 0.552, 0.552, 0.552, 0.552, 0.612,
-                                         0.612, 0.612, 0.612, 0.612, 0.612, 0.612,
-                                         0.664, 0.664, 0.664, 0.664, 0.664, 0.664,
-                                         0.664, 0.716, 0.716, 0.716, 0.716, 0.716,
-                                         0.716, 0.716, 0.77, 0.77, 0.77, 0.77,
-                                         0.77, 0.77, 0.77, 0.822, 0.822, 0.822,
-                                         0.822, 0.822, 0.822, 0.822, 0.878, 0.878,
-                                         0.878, 0.878, 0.878, 0.878, 0.878, 0.931,
-                                         0.931, 0.931, 0.931, 0.931, 0.931, 0.967,
-                                         0.99, 0.995, 0.99, 0.154, 0.154,
-                                         0.154, 0.154, 0.154, 0.227, 0.227, 0.227,
-                                         0.227, 0.227, 0.227, 0.227, 0.295, 0.295,
-                                         0.295, 0.295, 0.295, 0.295, 0.295, 0.36,
-                                         0.36, 0.36, 0.36, 0.36, 0.36, 0.36,
-                                         0.424, 0.424, 0.424, 0.424, 0.424, 0.424,
-                                         0.424, 0.492, 0.492, 0.492, 0.492, 0.492,
-                                         0.492, 0.492, 0.552, 0.552, 0.552, 0.552,
-                                         0.552, 0.552, 0.552, 0.612, 0.612, 0.612,
-                                         0.612, 0.612, 0.612, 0.612, 0.664, 0.664,
-                                         0.664, 0.664, 0.664, 0.664, 0.664, 0.716,
-                                         0.716, 0.716, 0.716, 0.716, 0.716, 0.716,
-                                         0.77, 0.77, 0.77, 0.77, 0.77, 0.77, 0.77,
-                                         0.822, 0.822, 0.822, 0.822, 0.822, 0.822,
-                                         0.822, 0.878, 0.878, 0.878, 0.878, 0.878,
-                                         0.878, 0.878, 0.931, 0.931, 0.931, 0.931,
-                                         0.931, 0.931, 0.967, 0.99, 0.995, 0.99),
-                                  V5 = c(0.614, 0.631, 0.664, 0.695, 0.73, 0.592,
-                                         0.616, 0.643, 0.671, 0.696, 0.726, 0.75,
-                                         0.575, 0.608, 0.636, 0.664, 0.696, 0.726,
-                                         0.758, 0.572, 0.604, 0.632, 0.664, 0.696,
-                                         0.728, 0.758, 0.568, 0.6, 0.632, 0.664,
-                                         0.692, 0.724, 0.758, 0.564, 0.596, 0.628,
-                                         0.66, 0.692, 0.726, 0.758, 0.56, 0.592,
-                                         0.624, 0.656, 0.692, 0.726, 0.758, 0.556,
-                                         0.588, 0.62, 0.656, 0.688, 0.722, 0.758,
-                                         0.532, 0.568, 0.604, 0.64, 0.676, 0.714,
-                                         0.754, 0.518, 0.552, 0.592, 0.632, 0.672,
-                                         0.71, 0.75, 0.504, 0.546, 0.584, 0.624,
-                                         0.664, 0.71, 0.75, 0.495, 0.536, 0.576,
-                                         0.62, 0.66, 0.702, 0.742, 0.495, 0.536,
-                                         0.572, 0.612, 0.652, 0.692, 0.728, 0.503,
-                                         0.544, 0.584, 0.62, 0.66, 0.702, 0.52,
-                                         0.584, 0.616, 0.652, 0.186, 0.169,
-                                         0.136, 0.105, 0.07, 0.208, 0.184, 0.157,
-                                         0.129, 0.104, 0.074, 0.05, 0.225, 0.192,
-                                         0.164, 0.136, 0.104, 0.074, 0.042, 0.228,
-                                         0.196, 0.168, 0.136, 0.104, 0.072, 0.042,
-                                         0.232, 0.2, 0.168, 0.136, 0.108, 0.076,
-                                         0.042, 0.236, 0.204, 0.172, 0.14, 0.108,
-                                         0.074, 0.042, 0.24, 0.208, 0.176, 0.144,
-                                         0.108, 0.074, 0.042, 0.244, 0.212, 0.18,
-                                         0.144, 0.112, 0.078, 0.042, 0.268, 0.232,
-                                         0.196, 0.16, 0.124, 0.086, 0.046, 0.282,
-                                         0.248, 0.208, 0.168, 0.128, 0.09, 0.05,
-                                         0.296, 0.254, 0.216, 0.176, 0.136, 0.09,
-                                         0.05, 0.305, 0.264, 0.224, 0.18, 0.14,
-                                         0.098, 0.058, 0.305, 0.264, 0.228, 0.188,
-                                         0.148, 0.108, 0.072, 0.297, 0.256, 0.216,
-                                         0.18, 0.14, 0.098, 0.28, 0.216, 0.184,
-                                         0.148),
-                                  V6 = c(0.11, 0.091, 0.079, 0.078, 0.09, 0.154,
-                                         0.154, 0.154, 0.154, 0.154, 0.154, 0.154,
-                                         0.227, 0.227, 0.227, 0.227, 0.227, 0.227,
-                                         0.227, 0.295, 0.295, 0.295, 0.295, 0.295,
-                                         0.295, 0.295, 0.36, 0.36, 0.36, 0.36,
-                                         0.36, 0.36, 0.36, 0.424, 0.424, 0.424,
-                                         0.424, 0.424, 0.424, 0.424, 0.492, 0.492,
-                                         0.492, 0.492, 0.492, 0.492, 0.492, 0.552,
-                                         0.552, 0.552, 0.552, 0.552, 0.552, 0.552,
-                                         0.612, 0.612, 0.612, 0.612, 0.612, 0.612,
-                                         0.612, 0.664, 0.664, 0.664, 0.664, 0.664,
-                                         0.664, 0.664, 0.716, 0.716, 0.716, 0.716,
-                                         0.716, 0.716, 0.716, 0.77, 0.77, 0.77,
-                                         0.77, 0.77, 0.77, 0.77, 0.822, 0.822,
-                                         0.822, 0.822, 0.822, 0.822, 0.822, 0.878,
-                                         0.878, 0.878, 0.878, 0.878, 0.878, 0.931,
-                                         0.931, 0.931, 0.931, 0.11, 0.091,
-                                         0.079, 0.078, 0.09, 0.154, 0.154, 0.154,
-                                         0.154, 0.154, 0.154, 0.154, 0.227, 0.227,
-                                         0.227, 0.227, 0.227, 0.227, 0.227, 0.295,
-                                         0.295, 0.295, 0.295, 0.295, 0.295, 0.295,
-                                         0.36, 0.36, 0.36, 0.36, 0.36, 0.36, 0.36,
-                                         0.424, 0.424, 0.424, 0.424, 0.424, 0.424,
-                                         0.424, 0.492, 0.492, 0.492, 0.492, 0.492,
-                                         0.492, 0.492, 0.552, 0.552, 0.552, 0.552,
-                                         0.552, 0.552, 0.552, 0.612, 0.612, 0.612,
-                                         0.612, 0.612, 0.612, 0.612, 0.664, 0.664,
-                                         0.664, 0.664, 0.664, 0.664, 0.664, 0.716,
-                                         0.716, 0.716, 0.716, 0.716, 0.716, 0.716,
-                                         0.77, 0.77, 0.77, 0.77, 0.77, 0.77, 0.77,
-                                         0.822, 0.822, 0.822, 0.822, 0.822, 0.822,
-                                         0.822, 0.878, 0.878, 0.878, 0.878, 0.878,
-                                         0.878, 0.931, 0.931, 0.931, 0.931),
-                                  V7 = c(0.631, 0.664, 0.696, 0.73, 0.76, 0.616,
-                                         0.643, 0.671, 0.696, 0.726, 0.75, 0.778,
-                                         0.608, 0.636, 0.664, 0.696, 0.726, 0.758,
-                                         0.786, 0.604, 0.632, 0.664, 0.696, 0.728,
-                                         0.758, 0.788, 0.6, 0.632, 0.664, 0.692,
-                                         0.724, 0.758, 0.79, 0.596, 0.628, 0.66,
-                                         0.692, 0.726, 0.758, 0.79, 0.592, 0.624,
-                                         0.656, 0.692, 0.726, 0.758, 0.79, 0.588,
-                                         0.62, 0.656, 0.688, 0.722, 0.758, 0.79,
-                                         0.568, 0.604, 0.64, 0.676, 0.714, 0.754,
-                                         0.79, 0.552, 0.592, 0.632, 0.672, 0.71,
-                                         0.75, 0.79, 0.546, 0.584, 0.624, 0.664,
-                                         0.71, 0.75, 0.79, 0.536, 0.576, 0.62,
-                                         0.66, 0.702, 0.742, 0.782, 0.536, 0.572,
-                                         0.612, 0.652, 0.692, 0.728, 0.77, 0.544,
-                                         0.584, 0.62, 0.66, 0.702, 0.744, 0.584,
-                                         0.616, 0.652, 0.708, 0.169, 0.136,
-                                         0.104, 0.07, 0.04, 0.184, 0.157, 0.129,
-                                         0.104, 0.074, 0.05, 0.022, 0.192, 0.164,
-                                         0.136, 0.104, 0.074, 0.042, 0.014, 0.196,
-                                         0.168, 0.136, 0.104, 0.072, 0.042, 0.012,
-                                         0.2, 0.168, 0.136, 0.108, 0.076, 0.042,
-                                         0.01, 0.204, 0.172, 0.14, 0.108, 0.074,
-                                         0.042, 0.01, 0.208, 0.176, 0.144, 0.108,
-                                         0.074, 0.042, 0.01, 0.212, 0.18, 0.144,
-                                         0.112, 0.078, 0.042, 0.01, 0.232, 0.196,
-                                         0.16, 0.124, 0.086, 0.046, 0.01, 0.248,
-                                         0.208, 0.168, 0.128, 0.09, 0.05, 0.01,
-                                         0.254, 0.216, 0.176, 0.136, 0.09, 0.05,
-                                         0.01, 0.264, 0.224, 0.18, 0.14, 0.098,
-                                         0.058, 0.018, 0.264, 0.228, 0.188, 0.148,
-                                         0.108, 0.072, 0.03, 0.256, 0.216, 0.18,
-                                         0.14, 0.098, 0.056, 0.216, 0.184, 0.148,
-                                         0.092),
-                                  V8 = c(0.091, 0.079, 0.078, 0.09, 0.116, 0.154,
-                                         0.154, 0.154, 0.154, 0.154, 0.154, 0.154,
-                                         0.227, 0.227, 0.227, 0.227, 0.227, 0.227,
-                                         0.227, 0.295, 0.295, 0.295, 0.295, 0.295,
-                                         0.295, 0.295, 0.36, 0.36, 0.36, 0.36,
-                                         0.36, 0.36, 0.36, 0.424, 0.424, 0.424,
-                                         0.424, 0.424, 0.424, 0.424, 0.492, 0.492,
-                                         0.492, 0.492, 0.492, 0.492, 0.492, 0.552,
-                                         0.552, 0.552, 0.552, 0.552, 0.552, 0.552,
-                                         0.612, 0.612, 0.612, 0.612, 0.612, 0.612,
-                                         0.612, 0.664, 0.664, 0.664, 0.664, 0.664,
-                                         0.664, 0.664, 0.716, 0.716, 0.716, 0.716,
-                                         0.716, 0.716, 0.716, 0.77, 0.77, 0.77,
-                                         0.77, 0.77, 0.77, 0.77, 0.822, 0.822,
-                                         0.822, 0.822, 0.822, 0.822, 0.822, 0.878,
-                                         0.878, 0.878, 0.878, 0.878, 0.878, 0.931,
-                                         0.931, 0.931, 0.931, 0.091, 0.079,
-                                         0.078, 0.09, 0.116, 0.154, 0.154, 0.154,
-                                         0.154, 0.154, 0.154, 0.154, 0.227, 0.227,
-                                         0.227, 0.227, 0.227, 0.227, 0.227, 0.295,
-                                         0.295, 0.295, 0.295, 0.295, 0.295, 0.295,
-                                         0.36, 0.36, 0.36, 0.36, 0.36, 0.36, 0.36,
-                                         0.424, 0.424, 0.424, 0.424, 0.424, 0.424,
-                                         0.424, 0.492, 0.492, 0.492, 0.492, 0.492,
-                                         0.492, 0.492, 0.552, 0.552, 0.552, 0.552,
-                                         0.552, 0.552, 0.552, 0.612, 0.612, 0.612,
-                                         0.612, 0.612, 0.612, 0.612, 0.664, 0.664,
-                                         0.664, 0.664, 0.664, 0.664, 0.664, 0.716,
-                                         0.716, 0.716, 0.716, 0.716, 0.716, 0.716,
-                                         0.77, 0.77, 0.77, 0.77, 0.77, 0.77, 0.77,
-                                         0.822, 0.822, 0.822, 0.822, 0.822, 0.822,
-                                         0.822, 0.878, 0.878, 0.878, 0.878, 0.878,
-                                         0.878, 0.931, 0.931, 0.931, 0.931))
+  pedar_insole_grid <- data.frame(
+    V1 = c(0.643, 0.671, 0.696, 0.726, 0.778, 0.608, 0.636, 0.664, 0.696, 0.726,
+           0.758, 0.786, 0.604, 0.632, 0.664, 0.696, 0.728, 0.758, 0.788, 0.6,
+           0.632, 0.664, 0.692, 0.724, 0.758, 0.79, 0.596, 0.628, 0.66, 0.692,
+           0.726, 0.758, 0.79, 0.592, 0.624, 0.656, 0.692, 0.726, 0.758, 0.79,
+           0.588, 0.62, 0.656, 0.688, 0.722, 0.758, 0.79, 0.568, 0.604, 0.64,
+           0.676, 0.714, 0.754, 0.79, 0.552, 0.592, 0.632, 0.672, 0.71, 0.75,
+           0.79, 0.546, 0.584, 0.624, 0.664, 0.71, 0.75, 0.79, 0.536, 0.576,
+           0.62, 0.66, 0.702, 0.742, 0.782, 0.536, 0.572, 0.612, 0.652, 0.692,
+           0.728, 0.77, 0.536, 0.572, 0.608, 0.64, 0.676, 0.714, 0.744, 0.554,
+           0.584, 0.616, 0.652, 0.684, 0.708, 0.572, 0.604, 0.636, 0.68, 0.157,
+           0.129, 0.104, 0.074, 0.022, 0.192, 0.164, 0.136, 0.104, 0.074, 0.042,
+           0.014, 0.196, 0.168, 0.136, 0.104, 0.072, 0.042, 0.012, 0.2, 0.168,
+           0.136, 0.108, 0.076, 0.042, 0.01, 0.204, 0.172, 0.14, 0.108, 0.074,
+           0.042, 0.01, 0.208, 0.176, 0.144, 0.108, 0.074, 0.042, 0.01, 0.212,
+           0.18, 0.144, 0.112, 0.078, 0.042, 0.01, 0.232, 0.196, 0.16, 0.124,
+           0.086, 0.046, 0.01, 0.248, 0.208, 0.168, 0.128, 0.09, 0.05, 0.01,
+           0.254, 0.216, 0.176, 0.136, 0.09, 0.05, 0.01, 0.264, 0.224, 0.18,
+           0.14, 0.098, 0.058, 0.018, 0.264, 0.228, 0.188, 0.148, 0.108, 0.072,
+           0.03, 0.264, 0.228, 0.192, 0.16, 0.124, 0.086, 0.056, 0.246, 0.216,
+           0.184, 0.148, 0.116, 0.092, 0.228, 0.196, 0.164, 0.12),
+    V2 = c(0.154, 0.154, 0.154, 0.154, 0.154, 0.227, 0.227, 0.227, 0.227, 0.227,
+           0.227, 0.227, 0.295, 0.295, 0.295, 0.295, 0.295, 0.295, 0.295, 0.36,
+           0.36, 0.36, 0.36, 0.36, 0.36, 0.36, 0.424, 0.424, 0.424, 0.424,
+           0.424, 0.424, 0.424, 0.492, 0.492, 0.492, 0.492, 0.492, 0.492, 0.492,
+           0.552, 0.552, 0.552, 0.552, 0.552, 0.552, 0.552, 0.612, 0.612, 0.612,
+           0.612, 0.612, 0.612, 0.612, 0.664, 0.664, 0.664, 0.664, 0.664, 0.664,
+           0.664, 0.716, 0.716, 0.716, 0.716, 0.716, 0.716, 0.716, 0.77, 0.77,
+           0.77, 0.77, 0.77, 0.77, 0.77, 0.822, 0.822, 0.822, 0.822, 0.822,
+           0.822, 0.822, 0.878, 0.878, 0.878, 0.878, 0.878, 0.878, 0.878, 0.931,
+           0.931, 0.931, 0.931, 0.931, 0.931, 0.99, 0.995, 0.99, 0.967, 0.154,
+           0.154, 0.154, 0.154, 0.154, 0.227, 0.227, 0.227, 0.227, 0.227, 0.227,
+           0.227, 0.295, 0.295, 0.295, 0.295, 0.295, 0.295, 0.295, 0.36, 0.36,
+           0.36, 0.36, 0.36, 0.36, 0.36, 0.424, 0.424, 0.424, 0.424, 0.424,
+           0.424, 0.424, 0.492, 0.492, 0.492, 0.492, 0.492, 0.492, 0.492, 0.552,
+           0.552, 0.552, 0.552, 0.552, 0.552, 0.552, 0.612, 0.612, 0.612, 0.612,
+           0.612, 0.612, 0.612, 0.664, 0.664, 0.664, 0.664, 0.664, 0.664, 0.664,
+           0.716, 0.716, 0.716, 0.716, 0.716, 0.716, 0.716, 0.77, 0.77, 0.77,
+           0.77, 0.77, 0.77, 0.77, 0.822, 0.822, 0.822, 0.822, 0.822, 0.822,
+           0.822, 0.878, 0.878, 0.878, 0.878, 0.878, 0.878, 0.878, 0.931, 0.931,
+           0.931, 0.931, 0.931, 0.931, 0.99, 0.995, 0.99, 0.967),
+    V3 = c(0.592, 0.643, 0.671, 0.696, 0.726, 0.575, 0.608, 0.636, 0.664, 0.696,
+           0.726, 0.758, 0.572, 0.604, 0.632, 0.664, 0.696, 0.728, 0.758, 0.568,
+           0.6, 0.632, 0.664, 0.692, 0.724, 0.758, 0.564, 0.596, 0.628, 0.66,
+           0.692, 0.726, 0.758, 0.56, 0.592, 0.624, 0.656, 0.692, 0.726, 0.758,
+           0.556, 0.588, 0.62, 0.656, 0.688, 0.722, 0.758, 0.532, 0.568, 0.604,
+           0.64, 0.676, 0.714, 0.754, 0.518, 0.552, 0.592, 0.632, 0.672, 0.71,
+           0.75, 0.504, 0.546, 0.584, 0.624, 0.664, 0.71, 0.75, 0.495, 0.536,
+           0.576, 0.62, 0.66, 0.702, 0.742, 0.495, 0.536, 0.572, 0.612, 0.652,
+           0.692, 0.728, 0.503, 0.536, 0.572, 0.608, 0.64, 0.676, 0.714, 0.52,
+           0.554, 0.584, 0.616, 0.652, 0.684, 0.544, 0.572, 0.604, 0.636, 0.208,
+           0.157, 0.129, 0.104, 0.074, 0.225, 0.192, 0.164, 0.136, 0.104, 0.074,
+           0.042, 0.228, 0.196, 0.168, 0.136, 0.104, 0.072, 0.042, 0.232, 0.2,
+           0.168, 0.136, 0.108, 0.076, 0.042, 0.236, 0.204, 0.172, 0.14, 0.108,
+           0.074, 0.042, 0.24, 0.208, 0.176, 0.144, 0.108, 0.074, 0.042, 0.244,
+           0.212, 0.18, 0.144, 0.112, 0.078, 0.042, 0.268, 0.232, 0.196, 0.16,
+           0.124, 0.086, 0.046, 0.282, 0.248, 0.208, 0.168, 0.128, 0.09, 0.05,
+           0.296, 0.254, 0.216, 0.176, 0.136, 0.09, 0.05, 0.305, 0.264, 0.224,
+           0.18, 0.14, 0.098, 0.058, 0.305, 0.264, 0.228, 0.188, 0.148, 0.108,
+           0.072, 0.297, 0.264, 0.228, 0.192, 0.16, 0.124, 0.086, 0.28, 0.246,
+           0.216, 0.184, 0.148, 0.116, 0.256, 0.228, 0.196, 0.164),
+    V4 = c(0.154, 0.154, 0.154, 0.154, 0.154, 0.227, 0.227, 0.227, 0.227, 0.227,
+           0.227, 0.227, 0.295, 0.295, 0.295, 0.295, 0.295, 0.295, 0.295, 0.36,
+           0.36, 0.36, 0.36, 0.36, 0.36, 0.36, 0.424, 0.424, 0.424, 0.424,
+           0.424, 0.424, 0.424, 0.492, 0.492, 0.492, 0.492, 0.492, 0.492, 0.492,
+           0.552, 0.552, 0.552, 0.552, 0.552, 0.552, 0.552, 0.612, 0.612, 0.612,
+           0.612, 0.612, 0.612, 0.612, 0.664, 0.664, 0.664, 0.664, 0.664, 0.664,
+           0.664, 0.716, 0.716, 0.716, 0.716, 0.716, 0.716, 0.716, 0.77, 0.77,
+           0.77, 0.77, 0.77, 0.77, 0.77, 0.822, 0.822, 0.822, 0.822, 0.822,
+           0.822, 0.822, 0.878, 0.878, 0.878, 0.878, 0.878, 0.878, 0.878, 0.931,
+           0.931, 0.931, 0.931, 0.931, 0.931, 0.967, 0.99, 0.995, 0.99, 0.154,
+           0.154, 0.154, 0.154, 0.154, 0.227, 0.227, 0.227, 0.227, 0.227, 0.227,
+           0.227, 0.295, 0.295, 0.295, 0.295, 0.295, 0.295, 0.295, 0.36, 0.36,
+           0.36, 0.36, 0.36, 0.36, 0.36, 0.424, 0.424, 0.424, 0.424, 0.424,
+           0.424, 0.424, 0.492, 0.492, 0.492, 0.492, 0.492, 0.492, 0.492, 0.552,
+           0.552, 0.552, 0.552, 0.552, 0.552, 0.552, 0.612, 0.612, 0.612, 0.612,
+           0.612, 0.612, 0.612, 0.664, 0.664, 0.664, 0.664, 0.664, 0.664, 0.664,
+           0.716, 0.716, 0.716, 0.716, 0.716, 0.716, 0.716, 0.77, 0.77, 0.77,
+           0.77, 0.77, 0.77, 0.77, 0.822, 0.822, 0.822, 0.822, 0.822, 0.822,
+           0.822, 0.878, 0.878, 0.878, 0.878, 0.878, 0.878, 0.878, 0.931, 0.931,
+           0.931, 0.931, 0.931, 0.931, 0.967, 0.99, 0.995, 0.99),
+    V5 = c(0.614, 0.631, 0.664, 0.695, 0.73, 0.592, 0.616, 0.643, 0.671, 0.696,
+           0.726, 0.75, 0.575, 0.608, 0.636, 0.664, 0.696, 0.726, 0.758, 0.572,
+           0.604, 0.632, 0.664, 0.696, 0.728, 0.758, 0.568, 0.6, 0.632, 0.664,
+           0.692, 0.724, 0.758, 0.564, 0.596, 0.628, 0.66, 0.692, 0.726, 0.758,
+           0.56, 0.592, 0.624, 0.656, 0.692, 0.726, 0.758, 0.556, 0.588, 0.62,
+           0.656, 0.688, 0.722, 0.758, 0.532, 0.568, 0.604, 0.64, 0.676, 0.714,
+           0.754, 0.518, 0.552, 0.592, 0.632, 0.672, 0.71, 0.75, 0.504, 0.546,
+           0.584, 0.624, 0.664, 0.71, 0.75, 0.495, 0.536, 0.576, 0.62, 0.66,
+           0.702, 0.742, 0.495, 0.536, 0.572, 0.612, 0.652, 0.692, 0.728, 0.503,
+           0.544, 0.584, 0.62, 0.66, 0.702, 0.52, 0.584, 0.616, 0.652, 0.186,
+           0.169, 0.136, 0.105, 0.07, 0.208, 0.184, 0.157, 0.129, 0.104, 0.074,
+           0.05, 0.225, 0.192, 0.164, 0.136, 0.104, 0.074, 0.042, 0.228, 0.196,
+           0.168, 0.136, 0.104, 0.072, 0.042, 0.232, 0.2, 0.168, 0.136, 0.108,
+           0.076, 0.042, 0.236, 0.204, 0.172, 0.14, 0.108, 0.074, 0.042, 0.24,
+           0.208, 0.176, 0.144, 0.108, 0.074, 0.042, 0.244, 0.212, 0.18, 0.144,
+           0.112, 0.078, 0.042, 0.268, 0.232, 0.196, 0.16, 0.124, 0.086, 0.046,
+           0.282, 0.248, 0.208, 0.168, 0.128, 0.09, 0.05, 0.296, 0.254, 0.216,
+           0.176, 0.136, 0.09, 0.05, 0.305, 0.264, 0.224, 0.18, 0.14, 0.098,
+           0.058, 0.305, 0.264, 0.228, 0.188, 0.148, 0.108, 0.072, 0.297, 0.256,
+           0.216, 0.18, 0.14, 0.098, 0.28, 0.216, 0.184, 0.148),
+    V6 = c(0.11, 0.091, 0.079, 0.078, 0.09, 0.154, 0.154, 0.154, 0.154, 0.154,
+           0.154, 0.154, 0.227, 0.227, 0.227, 0.227, 0.227, 0.227, 0.227, 0.295,
+           0.295, 0.295, 0.295, 0.295, 0.295, 0.295, 0.36, 0.36, 0.36, 0.36,
+           0.36, 0.36, 0.36, 0.424, 0.424, 0.424, 0.424, 0.424, 0.424, 0.424,
+           0.492, 0.492, 0.492, 0.492, 0.492, 0.492, 0.492, 0.552, 0.552, 0.552,
+           0.552, 0.552, 0.552, 0.552, 0.612, 0.612, 0.612, 0.612, 0.612, 0.612,
+           0.612, 0.664, 0.664, 0.664, 0.664, 0.664, 0.664, 0.664, 0.716, 0.716,
+           0.716, 0.716, 0.716, 0.716, 0.716, 0.77, 0.77, 0.77, 0.77, 0.77,
+           0.77, 0.77, 0.822, 0.822, 0.822, 0.822, 0.822, 0.822, 0.822, 0.878,
+           0.878, 0.878, 0.878, 0.878, 0.878, 0.931, 0.931, 0.931, 0.931, 0.11,
+           0.091, 0.079, 0.078, 0.09, 0.154, 0.154, 0.154, 0.154, 0.154, 0.154,
+           0.154, 0.227, 0.227, 0.227, 0.227, 0.227, 0.227, 0.227, 0.295, 0.295,
+           0.295, 0.295, 0.295, 0.295, 0.295, 0.36, 0.36, 0.36, 0.36, 0.36,
+           0.36, 0.36, 0.424, 0.424, 0.424, 0.424, 0.424, 0.424, 0.424, 0.492,
+           0.492, 0.492, 0.492, 0.492, 0.492, 0.492, 0.552, 0.552, 0.552, 0.552,
+           0.552, 0.552, 0.552, 0.612, 0.612, 0.612, 0.612, 0.612, 0.612, 0.612,
+           0.664, 0.664, 0.664, 0.664, 0.664, 0.664, 0.664, 0.716, 0.716, 0.716,
+           0.716, 0.716, 0.716, 0.716, 0.77, 0.77, 0.77, 0.77, 0.77, 0.77, 0.77,
+           0.822, 0.822, 0.822, 0.822, 0.822, 0.822, 0.822, 0.878, 0.878, 0.878,
+           0.878, 0.878, 0.878, 0.931, 0.931, 0.931, 0.931),
+    V7 = c(0.631, 0.664, 0.696, 0.73, 0.76, 0.616, 0.643, 0.671, 0.696, 0.726,
+           0.75, 0.778, 0.608, 0.636, 0.664, 0.696, 0.726, 0.758, 0.786, 0.604,
+           0.632, 0.664, 0.696, 0.728, 0.758, 0.788, 0.6, 0.632, 0.664, 0.692,
+           0.724, 0.758, 0.79, 0.596, 0.628, 0.66, 0.692, 0.726, 0.758, 0.79,
+           0.592, 0.624, 0.656, 0.692, 0.726, 0.758, 0.79, 0.588, 0.62, 0.656,
+           0.688, 0.722, 0.758, 0.79, 0.568, 0.604, 0.64, 0.676, 0.714, 0.754,
+           0.79, 0.552, 0.592, 0.632, 0.672, 0.71, 0.75, 0.79, 0.546, 0.584,
+           0.624, 0.664, 0.71, 0.75, 0.79, 0.536, 0.576, 0.62, 0.66, 0.702,
+           0.742, 0.782, 0.536, 0.572, 0.612, 0.652, 0.692, 0.728, 0.77, 0.544,
+           0.584, 0.62, 0.66, 0.702, 0.744, 0.584, 0.616, 0.652, 0.708, 0.169,
+           0.136, 0.104, 0.07, 0.04, 0.184, 0.157, 0.129, 0.104, 0.074, 0.05,
+           0.022, 0.192, 0.164, 0.136, 0.104, 0.074, 0.042, 0.014, 0.196, 0.168,
+           0.136, 0.104, 0.072, 0.042, 0.012, 0.2, 0.168, 0.136, 0.108, 0.076,
+           0.042, 0.01, 0.204, 0.172, 0.14, 0.108, 0.074, 0.042, 0.01, 0.208,
+           0.176, 0.144, 0.108, 0.074, 0.042, 0.01, 0.212, 0.18, 0.144, 0.112,
+           0.078, 0.042, 0.01, 0.232, 0.196, 0.16, 0.124, 0.086, 0.046, 0.01,
+           0.248, 0.208, 0.168, 0.128, 0.09, 0.05, 0.01, 0.254, 0.216, 0.176,
+           0.136, 0.09, 0.05, 0.01, 0.264, 0.224, 0.18, 0.14, 0.098, 0.058,
+           0.018, 0.264, 0.228, 0.188, 0.148, 0.108, 0.072, 0.03, 0.256, 0.216,
+           0.18, 0.14, 0.098, 0.056, 0.216, 0.184, 0.148, 0.092),
+    V8 = c(0.091, 0.079, 0.078, 0.09, 0.116, 0.154, 0.154, 0.154, 0.154, 0.154,
+           0.154, 0.154, 0.227, 0.227, 0.227, 0.227, 0.227, 0.227, 0.227, 0.295,
+           0.295, 0.295, 0.295, 0.295, 0.295, 0.295, 0.36, 0.36, 0.36, 0.36,
+           0.36, 0.36, 0.36, 0.424, 0.424, 0.424, 0.424, 0.424, 0.424, 0.424,
+           0.492, 0.492, 0.492, 0.492, 0.492, 0.492, 0.492, 0.552, 0.552, 0.552,
+           0.552, 0.552, 0.552, 0.552, 0.612, 0.612, 0.612, 0.612, 0.612, 0.612,
+           0.612, 0.664, 0.664, 0.664, 0.664, 0.664, 0.664, 0.664, 0.716, 0.716,
+           0.716, 0.716, 0.716, 0.716, 0.716, 0.77, 0.77, 0.77, 0.77, 0.77,
+           0.77, 0.77, 0.822, 0.822, 0.822, 0.822, 0.822, 0.822, 0.822, 0.878,
+           0.878, 0.878, 0.878, 0.878, 0.878, 0.931, 0.931, 0.931, 0.931, 0.091,
+           0.079, 0.078, 0.09, 0.116, 0.154, 0.154, 0.154, 0.154, 0.154, 0.154,
+           0.154, 0.227, 0.227, 0.227, 0.227, 0.227, 0.227, 0.227, 0.295, 0.295,
+           0.295, 0.295, 0.295, 0.295, 0.295, 0.36, 0.36, 0.36, 0.36, 0.36,
+           0.36, 0.36, 0.424, 0.424, 0.424, 0.424, 0.424, 0.424, 0.424, 0.492,
+           0.492, 0.492, 0.492, 0.492, 0.492, 0.492, 0.552, 0.552, 0.552, 0.552,
+           0.552, 0.552, 0.552, 0.612, 0.612, 0.612, 0.612, 0.612, 0.612, 0.612,
+           0.664, 0.664, 0.664, 0.664, 0.664, 0.664, 0.664, 0.716, 0.716, 0.716,
+           0.716, 0.716, 0.716, 0.716, 0.77, 0.77, 0.77, 0.77, 0.77, 0.77, 0.77,
+           0.822, 0.822, 0.822, 0.822, 0.822, 0.822, 0.822, 0.878, 0.878, 0.878,
+           0.878, 0.878, 0.878, 0.931, 0.931, 0.931, 0.931))
   return(pedar_insole_grid)
 }
