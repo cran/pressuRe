@@ -8,14 +8,16 @@ create_mask_auto(
   pressure_data,
   masking_scheme,
   foot_side = "auto",
-  res_value = c(20000, 20000, 1e+05, 20000),
+  res_value = c(20000, 20000, 1e+05, 50000),
   plot = TRUE,
-  template_mask = NULL
+  template_mask = NULL,
+  hal_start = 0.5,
+  toe_start = 0.2
 )
 }
 \arguments{
-\item{pressure_data}{List. First item is a 3D array covering each timepoint
-of the measurement. z dimension represents time}
+\item{pressure_data}{List. First item should be a 2D array covering each
+timepoint of the measurement.}
 
 \item{masking_scheme}{String. "automask_simple", "automask_novel",
 "pedar_mask1", "pedar_mask2", "pedar_mask3", "template".
@@ -46,12 +48,16 @@ for that algorithm}
 
 \item{template_mask}{Data frame. Mask to be used if "template_mask" is
 selected as the masking scheme}
+
+\item{hal_start}{Numeric. Adjust medial start point of toe line}
+
+\item{toe_start}{Numeric. Adjust lateral start point of toe line}
 }
 \value{
 List. Masks are added to pressure data variable
 \itemize{
-  \item pressure_array. 3D array covering each timepoint of the measurement.
-           z dimension represents time
+  \item pressure_array. 2D array covering each timepoint of the measurement.
+           Sensors are columns, time is rows
   \item pressure_system. String defining pressure system
   \item sens_size. Numeric vector with the dimensions of the sensors
   \item time. Numeric value for time between measurements

@@ -1,6 +1,4 @@
 # to do (current version)
-## low cost paths to define heel and forefoot automasks
-## low cost path to define hallux automask
 ## pliance if sensors matrix then add max_matrix
 ## fscan processing needs to be checked (work with NA?)
 ## in edit_mask, make edit_list a vector that works with numbers or names?
@@ -16,15 +14,6 @@
 ## cop for pedar
 ## UNITS!!!
 
-# data list:
-## Array. pressure data
-## String. data type (usually collection system, e.g. emed)
-## Numeric. sens_size. sensor size
-## Numeric. Single number time between samples
-## List. Mask list
-## Data frame. Events (for example, to define start/end of individual steps for insole data)
-## Data frame. Sensor polygon coordinates
-
 
 # =============================================================================
 
@@ -36,8 +25,8 @@
 #'   foot contact
 #' @return A list with information about the pressure data.
 #' \itemize{
-#'   \item pressure_array. 3D array covering each timepoint of the measurement.
-#'            z dimension represents time
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            Sensors are columns, time is rows
 #'   \item pressure_system. String defining pressure system
 #'   \item sens_size. Numeric vector with the areas of the sensors
 #'   \item time. Numeric value for time between measurements
@@ -112,7 +101,8 @@ load_emed <- function(pressure_filepath, trim_active = FALSE) {
 
       # load as table
       y <- pressure_raw[(breaks[str] + 10):(ends[which(ends > breaks[str])[1]] - 1)]
-      z <- read.table(textConnection(y), sep = "", header = TRUE)
+      z <- read.table(textConnection(y), sep = "\t", header = TRUE, row.names = 1,
+                      strip.white = TRUE, na.strings = "")
 
       # remove zeros
       z[is.na(z)] <- 0
@@ -182,7 +172,7 @@ load_emed <- function(pressure_filepath, trim_active = FALSE) {
   # return formatted emed data
   return(list(pressure_array = full_mat, pressure_system = "emed",
               sens_size = sens_areas, time = time, masks = NULL, events = NULL,
-              sens_polygons = sens_array, max_matrix = max_mat))
+              sensor_polygons = sens_array, max_matrix = max_mat))
 }
 
 
@@ -194,8 +184,8 @@ load_emed <- function(pressure_filepath, trim_active = FALSE) {
 #' @param pressure_filepath String. Filepath pointing to pedar pressure file
 #' @return A list with information about the pressure data.
 #' \itemize{
-#'   \item pressure_array. 3D array covering each timepoint of the measurement.
-#'            z dimension represents time
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            Sensors are columns, time is rows
 #'   \item pressure_system. String defining pressure system
 #'   \item sens_size. String with sensor type
 #'   \item time. Numeric value for time between measurements
@@ -265,8 +255,8 @@ load_pedar <- function(pressure_filepath) {
 #' @param pressure_filepath String. Filepath pointing to pliance pressure file
 #' @return A list with information about the pressure data.
 #' \itemize{
-#'   \item pressure_array. 3D array covering each timepoint of the measurement.
-#'            z dimension represents time
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            Sensors are columns, time is rows
 #'   \item pressure_system. String defining pressure system
 #'   \item sens_size. String with sensor type
 #'   \item time. Numeric value for time between measurements
@@ -280,6 +270,7 @@ load_pedar <- function(pressure_filepath) {
 #' pressure_data <- load_pliance(pliance_data)
 #' @importFrom stringr str_split str_trim
 #' @importFrom sf st_centroid
+#' @importFrom dplyr dense_rank
 #' @export
 
 load_pliance <- function(pressure_filepath) {
@@ -323,6 +314,7 @@ load_pliance <- function(pressure_filepath) {
   sensor_array <- t(sensor_array[, 2:ncol(sensor_array)]) / 100
   sens_array_full <- sensor_2_polygon2(sensor_array)
   sens_array <- sens_array_full %>% filter(id %in% active_sensors)
+  sens_array <- sens_array %>% mutate(id = dense_rank(id))
 
   # sensor areas
   sens_areas <- sensor_area(sens_array)
@@ -376,10 +368,12 @@ load_pliance <- function(pressure_filepath) {
 #' @description Imports and formats files collected on tekscan systems and
 #'    exported from Tekscan software
 #' @param pressure_filepath String. Filepath pointing to emed pressure file
+#' @param rm_inactive Logical. Whether to remove inactive rows from dataset
+#' @param rotate Numeric. Rotate pressure image 90, 180, or 270 degrees
 #' @return A list with information about the pressure data.
 #' \itemize{
-#'   \item pressure_array. 3D array covering each timepoint of the measurement.
-#'            z dimension represents time
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            Sensors are columns, time is rows
 #'   \item pressure_system. String defining pressure system
 #'   \item sens_size. Numeric vector with the dimensions of the sensors
 #'   \item time. Numeric value for time between measurements
@@ -393,7 +387,7 @@ load_pliance <- function(pressure_filepath) {
 #' pressure_data <- load_tekscan(tekscan_data)
 #' @export
 
-load_tekscan <- function(pressure_filepath) {
+load_tekscan <- function(pressure_filepath, rm_inactive = F, rotate = 0) {
   # check parameters
   ## file exists
   if (file.exists(pressure_filepath) == FALSE)
@@ -421,11 +415,18 @@ load_tekscan <- function(pressure_filepath) {
   if (str_detect(pressure_raw[sens_width], "centimeters") == TRUE) {
     sens_size <- sens_size * 0.01
   }
+  if (str_detect(pressure_raw[sens_width], "inches") == TRUE) {
+    sens_size <- sens_size * 0.0254
+  }
 
   # get capture frequency
   time_line <- which(grepl("SECONDS_PER_FRAME", pressure_raw))
   time_ln <- str_split(pressure_raw[time_line], "FRAME ")[[1]][2]
   time <- as.numeric(unlist(str_extract_all(time_ln, "\\d+\\.\\d+")))
+
+  # get pressure units
+  press_unit_line <- which(grepl("UNITS", pressure_raw))
+  press_unit <- str_split(pressure_raw[press_unit_line], "UNITS ")[[1]][2]
 
   # determine position breaks
   breaks <- grep("Frame", pressure_raw)
@@ -435,7 +436,11 @@ load_tekscan <- function(pressure_filepath) {
   row_n <- breaks[2] - breaks[1] - 2
 
   # empty array
-  pressure_array <- array(0, dim = c(row_n, col_n, length(breaks)))
+  if (rotate == 90 | rotate == 270) {
+    pressure_array <- array(0, dim = c(col_n, row_n, length(breaks)))
+  } else {
+    pressure_array <- array(0, dim = c(row_n, col_n, length(breaks)))
+  }
 
   # fill array
   for (i in 1:length(breaks)) {
@@ -444,7 +449,36 @@ load_tekscan <- function(pressure_filepath) {
     z <- read.table(textConnection(y), sep = ",")
     z[z == "B"] <- -1
     z <- as.data.frame(lapply(z, as.numeric))
-    pressure_array[, , i] <- as.matrix(z)
+    z_mat <- as.matrix(z)
+    if (rotate != 0) {
+      if (rotate == 90) {z_mat <- apply(t(z_mat), 2, rev)}
+      if (rotate == 180) {z_mat <- rev(apply(z_mat, 1, rev))}
+      if (rotate == 270) {z_mat <- t(apply(z_mat, 2, rev))}
+    }
+    pressure_array[, , i] <- z_mat
+  }
+
+  # remove zero columns and rows
+  if (rm_inactive == TRUE) {
+    fpc <- apply(simplify2array(pressure_array), 1:2, max)
+
+    ## rows
+    rsums <- rowSums(fpc)
+    minr <- min(which(rsums > 0))
+    maxr <- max(which(rsums > 0))
+
+    ## columns
+    csums <- colSums(fpc)
+    minc <- min(which(csums > 0))
+    maxc <- max(which(csums > 0))
+
+    ## update pressure array
+    pressure_array <- pressure_array[minr:maxr, minc:maxc,]
+  }
+
+  # adjust pressure units if required
+  if (press_unit == "PSI") {
+    pressure_array <- pressure_array * 6.89476
   }
 
   # make max mat
@@ -452,7 +486,11 @@ load_tekscan <- function(pressure_filepath) {
 
   # active sensor polygons
   active_sensors <- which(max_mat > 0, arr.ind = TRUE)
-  sens_polygons <- sensor_2_polygon3(max_mat, sens_size[1], sens_size[2])
+  if (rotate == 90 | rotate == 270) {
+    sens_polygons <- sensor_2_polygon3(max_mat, sens_size[2], sens_size[1])
+  } else {
+    sens_polygons <- sensor_2_polygon3(max_mat, sens_size[1], sens_size[2])
+  }
 
   # active sensor areas
   sens_areas <- sensor_area(sens_polygons)
@@ -464,8 +502,8 @@ load_tekscan <- function(pressure_filepath) {
   }
 
   # return formatted data
-  return(list(pressure_array = pressure_array, pressure_system = "tekscan",
-              sens_size = sens_size, time = time, masks = NULL, events = NULL,
+  return(list(pressure_array = full_mat, pressure_system = "tekscan",
+              sens_size = sens_areas, time = time, masks = NULL, events = NULL,
               sensor_polygons = sens_polygons, max_matrix = max_mat))
 }
 
@@ -478,8 +516,8 @@ load_tekscan <- function(pressure_filepath) {
 #' @param pressure_filepath String. Filepath pointing to emed pressure file
 #' @return A list with information about the pressure data.
 #' \itemize{
-#'   \item pressure_array. 3D array covering each timepoint of the measurement.
-#'            z dimension represents time
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            Sensors are columns, time is rows
 #'   \item pressure_system. String defining pressure system
 #'   \item sens_size. Numeric vector with the dimensions of the sensors
 #'   \item time. Numeric value for time between measurements
@@ -515,6 +553,9 @@ load_footscan <- function(pressure_filepath) {
   # determine position breaks
   c1 <- unname(unlist(as.vector(pressure_raw[, 1])))
   breaks <- grep("Frame", c1)
+
+  # footprint position offset
+  rects <- grep("Rectangle", c1)
 
   # get capture frequency
   time <- regmatches(c1[breaks[2]], gregexpr("(?<=\\().*?(?=\\))",
@@ -553,9 +594,9 @@ load_footscan <- function(pressure_filepath) {
   }
 
   # return formatted data
-  return(list(pressure_array = pressure_array, pressure_system = "footscan",
+  return(list(pressure_array = full_mat, pressure_system = "footscan",
               sens_size = sens_areas, time = time, masks = NULL, events = NULL,
-              sensor_polygon = sens_polygons, max_matrix = max_mat))
+              sensor_polygons = sens_polygons, max_matrix = max_mat))
 }
 
 
@@ -576,11 +617,13 @@ load_footscan <- function(pressure_filepath) {
 #'   \item sensor_polygons. Data frame with corners of sensors
 #'   \item max_matrix. Matrix
 #'  }
-#' @examples
-#' xsensor_data <- system.file("extdata", "xsensor_data.csv", package = "pressuRe")
-#' pressure_data <- load_xsensor(xsensor_data)
+# @examples
+# xsensor_data <- system.file("extdata", "xsensor_data.csv", package = "pressuRe")
+# pressure_data <- load_xsensor(xsensor_data)
 #' @importFrom abind abind
+#' @importFrom stringr str_remove_all str_extract
 #' @export
+
 load_xsensor <- function(pressure_filepath) {
   # check parameters
   ## file exists
@@ -593,6 +636,13 @@ load_xsensor <- function(pressure_filepath) {
 
   # Read unformatted emed data
   pressure_raw <- readLines(pressure_filepath, warn = FALSE)
+
+  # get sensor matrix dimensions
+  ## matrix size
+  n_row <- which(grepl("Rows", pressure_raw))[1]
+  n_row <- as.numeric(unlist(str_extract_all(pressure_raw[n_row], "\\d+")))
+  n_col <- which(grepl("Columns", pressure_raw))[1]
+  n_col <- as.numeric(unlist(str_extract_all(pressure_raw[n_col], "\\d+")))
 
   # get sensor size
   sens_w_ln <- which(grepl("Sensel Width", pressure_raw, useBytes = TRUE))[1]
@@ -609,49 +659,68 @@ load_xsensor <- function(pressure_filepath) {
   # get capture frequency
   time_ln <- which(grepl("^Time,", pressure_raw, useBytes = TRUE))[c(10, 11)]
   time_1 <- str_split(pressure_raw[time_ln[1]], ",")[[1]][2]
+  time_1 <- str_remove_all(time_1, "^[^0-9]+|[^0-9]+$")
   time_1 <- as.POSIXct(time_1, format = "%H:%M:%OS")
   time_2 <- str_split(pressure_raw[time_ln[2]], ",")[[1]][2]
+  time_2 <- str_remove_all(time_2, "^[^0-9]+|[^0-9]+$")
   time_2 <- as.POSIXct(time_2, format = "%H:%M:%OS")
   time <- as.numeric(difftime(time_2, time_1))
 
-  # right foot
-  ## determine position breaks
+  # number of sensors
+  sensor_lns <- which(grepl("^SENSOR,", pressure_raw, useBytes = TRUE))
+  sensor_names <- unique(str_extract(pressure_raw[sensor_lns], "(?<=\").*(?=\")"))
+
+  # determine position breaks
   breaks <- str_which(pressure_raw, "FRAME")
-  rf <- str_which(pressure_raw, "RF")
-  lf <- str_which(pressure_raw, "LF")
-  sensels <- str_which(pressure_raw, "SENSELS")
 
-  ## matrix size
-  n_row <- which(grepl("Rows", pressure_raw))[1]
-  n_row <- as.numeric(unlist(str_extract_all(pressure_raw[n_row], "\\d+")))
-  n_col <- which(grepl("Columns", pressure_raw))[1]
-  n_col <- as.numeric(unlist(str_extract_all(pressure_raw[n_col], "\\d+")))
+  # sensel lines
+  sensel_lns <- str_which(pressure_raw, "SENSELS")
 
-  ## get frames
-  pressure_array_r <- array(0, dim = c(n_row, n_col, length(breaks)))
-  pressure_array_l <- pressure_array_r
-
-  for (frm in seq_along(breaks)) {
-    # right
-    rf_ln <- rf[which(rf > breaks[frm])][1]
-    sensel_ln <- sensels[which(sensels > rf_ln)][1]
-    y <- pressure_raw[(sensel_ln + 2):(sensel_ln + 2 + (n_row * 2))]
-    y <- y[seq(1, (n_row * 2), 2)]
+  # pressure data
+  pressure_array <- array(0, dim = c(n_row, n_col, length(breaks)))
+  for (sensel in seq_along(sensel_lns)) {
+    y <- pressure_raw[(sensel_lns[sensel] + 1):(sensel_lns[sensel] + n_row)]
     z <- read.table(textConnection(y), sep = ",")[, 1:n_col]
-    pressure_array_r[,, frm] <- as.matrix(z)
-
-    # left
-    lf_ln <- lf[which(lf > breaks[frm])][1]
-    sensel_ln <- sensels[which(sensels > lf_ln)][1]
-    y <- pressure_raw[(sensel_ln + 2):(sensel_ln + 2 + (n_row * 2))]
-    y <- y[seq(1, (n_row * 2), 2)]
-    z <- read.table(textConnection(y), sep = ",")[, 1:n_col]
-    pressure_array_l[,, frm] <- as.matrix(z)
+    pressure_array[,, sensel] <- as.matrix(z)
   }
 
+  #rf_ln <- rf[which(rf > breaks[frm])][1]
+  #  sensel_ln <- sensels[which(sensels > rf_ln)][1]
+  #  y <- pressure_raw[(sensel_ln + 2):(sensel_ln + 2 + (n_row * 2))]
+  #  y <- y[seq(1, (n_row * 2), 2)]
+  #  z <- read.table(textConnection(y), sep = ",")[, 1:n_col]
+  #  pressure_array_r[,, frm] <- as.matrix(z)
+  #}
+
+  #rf <- str_which(pressure_raw, "RF")
+  #lf <- str_which(pressure_raw, "LF")
+  #sensels <- str_which(pressure_raw, "SENSELS")
+
+  ## get frames
+  #pressure_array_r <- array(0, dim = c(n_row, n_col, length(breaks)))
+  #pressure_array_l <- pressure_array_r
+
+  #for (frm in seq_along(breaks)) {
+  #  # right
+  #  rf_ln <- rf[which(rf > breaks[frm])][1]
+  #  sensel_ln <- sensels[which(sensels > rf_ln)][1]
+  #  y <- pressure_raw[(sensel_ln + 2):(sensel_ln + 2 + (n_row * 2))]
+  #  y <- y[seq(1, (n_row * 2), 2)]
+  #  z <- read.table(textConnection(y), sep = ",")[, 1:n_col]
+  #  pressure_array_r[,, frm] <- as.matrix(z)
+
+  #  # left
+  #  lf_ln <- lf[which(lf > breaks[frm])][1]
+  #  sensel_ln <- sensels[which(sensels > lf_ln)][1]
+  #  y <- pressure_raw[(sensel_ln + 2):(sensel_ln + 2 + (n_row * 2))]
+  #  y <- y[seq(1, (n_row * 2), 2)]
+  #  z <- read.table(textConnection(y), sep = ",")[, 1:n_col]
+  #  pressure_array_l[,, frm] <- as.matrix(z)
+  #}
+
   # join left and right (separate by 2 empty cols)
-  empty <- array(0, c(n_row, 2, length(breaks)))
-  pressure_array <- abind::abind(pressure_array_l, empty, pressure_array_r, along = 2)
+  #empty <- array(0, c(n_row, 2, length(breaks)))
+  #pressure_array <- abind::abind(pressure_array_l, empty, pressure_array_r, along = 2)
 
   # make max mat
   max_mat <- apply(simplify2array(pressure_array), 1:2, max)
@@ -661,7 +730,7 @@ load_xsensor <- function(pressure_filepath) {
   sens_array <- sensor_2_polygon3(max_mat, sens_w, sens_h)
 
   # active sensor areas
-  sens_areas <- sensor_area(sens_array)
+  #sens_areas <- sensor_area(sens_array)
 
   # array to 2d matrix
   full_mat <- matrix(NA, nrow = dim(pressure_array)[3], ncol = nrow(active_sensors))
@@ -671,8 +740,71 @@ load_xsensor <- function(pressure_filepath) {
 
   # return formatted xsensor data
   return(list(pressure_array = full_mat, pressure_system = "xsensor",
-              sens_size = sens_areas, time = time, masks = NULL, events = NULL,
-              sens_polygons = sens_array, max_matrix = max_mat))
+              sens_size = rep(sens_size, nrow(full_mat)), time = time, masks = NULL, events = NULL,
+              sensor_polygons = sens_array, max_matrix = max_mat))
+}
+
+
+# =============================================================================
+
+#' @title Load stappone data
+#' @description Imports and formats .asc files collected on stappone system
+#' @param pressure_filepath String. Filepath pointing to stappone pressure file
+#' @return A list with information about the pressure data.
+#' \itemize{
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            Sensors are columns, time is rows
+#'   \item pressure_system. String defining pressure system
+#'   \item sens_size. String with sensor type
+#'   \item time. Numeric value for time between measurements
+#'   \item masks. List
+#'   \item events. List
+#'   \item sensor_polygons. Data frame with corners of sensors
+#'   \item max_matrix Matrix with maximum image
+#'  }
+#' @examples
+#' stappone_data <- system.file("extdata", "stappone_example.csv", package = "pressuRe")
+#' pressure_data <- load_stappone(stappone_data)
+#' @importFrom stringr str_split str_trim str_detect
+#' @importFrom utils read.csv
+#' @export
+
+load_stappone <- function(pressure_filepath) {
+  # check parameters
+  ## file exists
+  if (file.exists(pressure_filepath) == FALSE)
+    stop("file does not exist")
+
+  ## extension is correct
+  if (str_split(basename(pressure_filepath), "\\.")[[1]][2] != "csv")
+    stop("incorrect file extension, expected .csv")
+
+  # import data
+  pressure_data <- as.data.frame(read.csv(pressure_filepath, header = TRUE))
+
+  # Get time between measurements
+  time <- (pressure_data[2,2] - pressure_data[1, 2]) / 1000
+
+  # make pressure array
+  stapp_colnames <- colnames(pressure_data)
+  pressure_cols <- str_detect(stapp_colnames, "pressure")
+  pressure_array <- as.matrix(pressure_data[, pressure_cols])
+
+  # get sensor polygons
+  sens_polygons <- stappone_insole_polys()
+  sens_polygons$y <- sens_polygons$y + 40
+  if (pressure_data[1, 1] == 1) {
+    sens_polygons$x <- sens_polygons$x + 100
+  }
+  if (pressure_data[1, 1] == 2) {
+    sens_polygons$x <- sens_polygons$x * -1
+  }
+  sens_polygons[, c(2, 3)] <- sens_polygons[, c(2, 3)] / 1000
+
+  # return
+  return(list(pressure_array = pressure_array, pressure_system = "stappone",
+              sens_size = NULL, time = time, masks = NULL,
+              events = NULL, sensor_polygons = sens_polygons, max_matrix = NA))
 }
 
 
@@ -686,8 +818,8 @@ load_xsensor <- function(pressure_filepath) {
 #' @param interp_to Integer. Number of frames to interpolate to
 #' @return
 #' \itemize{
-#'   \item pressure_array. 3D array covering each timepoint of the measurement.
-#'            z dimension represents time
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            Sensors are columns, time is rows
 #'   \item pressure_system. String defining pressure system
 #'   \item sens_size. Numeric vector with the dimensions of the sensors
 #'   \item time. Numeric value for time between measurements
@@ -735,6 +867,79 @@ pressure_interp <- function(pressure_data, interp_to) {
 
 # =============================================================================
 
+#' @title Manually remove individual sensors
+#' @description Select sensors, often with abherrant readings, and remove from
+#' the dataset
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement. z dimension represents time.
+#' @return
+#' \itemize{
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            Sensors are columns, time is rows
+#'   \item pressure_system. String defining pressure system
+#'   \item sens_size. Numeric vector with the dimensions of the sensors
+#'   \item time. Numeric value for time between measurements
+#'   \item masks. List
+#'   \item events. List
+#'   \item sensor_polygons. Data frame with corners of sensors
+#'   \item max_matrix. Matrix
+#'  }
+#' @examplesIf interactive()
+#' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
+#' pressure_data <- load_emed(emed_data)
+#' pressure_data <- clean_pressure(pressure_data)
+#' @export
+
+clean_pressure <- function(pressure_data) {
+  # set up global variables
+  id <- NULL
+
+  # plot pressure image
+  grDevices::x11()
+  g <- plot_pressure(pressure_data, plot = FALSE)
+  print(g)
+
+  # select sensor
+  sensor_pts <- gg_locator(1)
+
+  # find which sensors points fall in
+  sens_polys <- pressure_data[[7]]
+  sens_polys[, 1] <- round(sens_polys[, 1], 8)
+  sens_polys[, 2] <- round(sens_polys[, 2], 8)
+  sensor_polygons <- sens_df_2_polygon(sens_polys)
+  point <- sf::st_point(c(sensor_pts[1, 1], sensor_pts[1, 2]))
+  for (sens_idx in 1:length(sensor_polygons)) {
+    if (length(st_intersects(sensor_polygons[[sens_idx]], point)[[1]]) == 1) {
+      sensor_n <- sens_idx
+    }
+  }
+
+  # remove sensor values
+  pressure_data_1 <- pressure_data[[1]]
+  pressure_data_1 <- pressure_data_1[, -sensor_n]
+  pressure_data[[1]] <- pressure_data_1
+
+  # remove sensor area
+  pressure_data_3 <- pressure_data[[3]]
+  pressure_data_3 <- pressure_data_3[-sensor_n]
+  pressure_data[[3]] <- pressure_data_3
+
+  # remove sensor polygon
+  pressure_data_7 <- pressure_data[[7]]
+  pressure_data_7 <- pressure_data_7 %>% filter(id != sensor_n) %>%
+    mutate(id = dense_rank(id))
+  pressure_data[[7]] <- pressure_data_7
+
+  # remove from max_matrix
+  pressure_data[[8]] <- poly_2_matrix(pressure_data)
+
+  # return
+  return(pressure_data)
+}
+
+
+# =============================================================================
+
 #' @title Select steps
 #' @description Select steps, usually from insole data, and format for analysis
 #' @param pressure_data List. First item should be a 3D array covering each
@@ -749,8 +954,8 @@ pressure_interp <- function(pressure_data, interp_to) {
 #' and not representative of steady state walking so this removes them
 #' @return
 #' \itemize{
-#'   \item pressure_array. 3D array covering each timepoint of the measurement.
-#'            z dimension represents time
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            Sensors are columns, time is rows
 #'   \item pressure_system. String defining pressure system
 #'   \item sens_size. Numeric vector with the dimensions of the sensors
 #'   \item time. Numeric value for time between measurements
@@ -779,8 +984,9 @@ select_steps <- function (pressure_data, threshold = "auto", min_frames = 10,
     stop("user needs to select suitable steps")
 
   # check this is pedar (or other suitable) data
-  if (!(pressure_data[[2]] == "pedar" || pressure_data[[2]] == "tekscan"))
-    stop("data should be from pedar or f-scan")
+  if (!(pressure_data[[2]] == "pedar" || pressure_data[[2]] == "tekscan" ||
+        pressure_data[[2]] == "stappone"))
+    stop("data should be from pedar, f-scan, or stappone")
 
   # get force df
   if (pressure_data[[2]] == "pedar") {
@@ -825,8 +1031,8 @@ select_steps <- function (pressure_data, threshold = "auto", min_frames = 10,
 #' right), usually would only be needed for barefoot pressure plate data.
 #' Generally reliable but may be thrown off by severe deformities or abnormal
 #' walking patterns
-#' @param pressure_data List. First item should be a 3D array covering each
-#' timepoint of the measurement. z dimension represents time
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @return String. "LEFT" or "RIGHT"
 #' @examples
 #' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
@@ -839,8 +1045,7 @@ select_steps <- function (pressure_data, threshold = "auto", min_frames = 10,
 
 auto_detect_side <- function(pressure_data) {
   # throw error if pedar data
-  if (!(pressure_data[[2]] == "emed" | pressure_data[[2]] == "footscan" |
-        pressure_data[[2]] == "pliance"))
+  if (pressure_data[[2]] == "pedar")
     stop("This function currently only works for pressure plate data")
 
   # Bounding box
@@ -910,8 +1115,8 @@ auto_detect_side <- function(pressure_data) {
 #' @title Whole pressure curve
 #' @description Generates vectors with option to plot for force, peak/mean
 #' pressure and area for complete measurement. Useful for checking data
-#' @param pressure_data List. A 3D array covering each timepoint of the
-#'   measurement. z dimension represents time
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param variable String. "peak_pressure", "force", or "area"
 #' @param side For insole data only
 #' @param threshold Numeric. Threshold value for sensor to be considered active.
@@ -986,8 +1191,7 @@ whole_pressure_curve <- function(pressure_data, variable, side, threshold = 10,
       # find active area for each frame and store in vector
       active_cells <- pressure_data[[1]]
       active_cells[active_cells > 0] <- 1
-      active_cells <- t(t(active_cells) * pressure_data[[3]])
-      values <- rowSums(active_cells) * 10000
+      values <- rowSums(active_cells) * pressure_data[[3]][1] * 10000
     }
     variable_units <- "contact area (cm2)"
   }
@@ -1017,8 +1221,8 @@ whole_pressure_curve <- function(pressure_data, variable, side, threshold = 10,
 #' @title Center of pressure
 #' @description Generates xy coordinates for center of pressure during each
 #' frame of measurement
-#' @param pressure_data List. First item is a 3D array covering each timepoint
-#' of the measurement. z dimension represents time
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @return Data frame with x and y coordinates of COP throughout trial
 #' @examples
 #' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
@@ -1064,8 +1268,8 @@ cop <- function(pressure_data) {
 
 #' @title Footprint
 #' @description Determines footprint of pressure data
-#' @param pressure_data List. Includes a 3D array covering each timepoint of the
-#'   measurement. z dimension represents time
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param variable String. "max" = maximum value of each sensor across full
 #' dataset. "mean" = average value of sensors over full dataset."frame" = an
 #' individual pressure frame. "meanmax" average max values across cycles (
@@ -1147,8 +1351,8 @@ footprint <- function(pressure_data, variable = "max", frame = NULL,
 
 #' @title Plot pressure
 #' @description Produces visualization of pressure data
-#' @param pressure_data List. Includes a 3D array covering each timepoint of the
-#'   measurement. z dimension represents time
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param variable String. "max" = footprint of maximum sensors. "mean" =
 #' average value of sensors over time (usually for static analyses). "frame" =
 #' an individual frame
@@ -1196,14 +1400,26 @@ plot_pressure <- function(pressure_data, variable = "max", smooth = FALSE,
     stop("pressure data must contain array")
 
   # if pedar
-  if (pressure_data[[2]] == "pedar") {
-    if (step_n == "max") {pedar_var <- "max"; step_no <- NA}
-    if (step_n == "meanmax") {pedar_var <- "meanmax"; step_no <- NA}
-    if (is.numeric(step_n)) {pedar_var <- "step_max"; step_no <- step_n}
-    cor <- plot_pedar(pressure_data, pedar_var, step_no, foot_side = "both")
-    x_lims <- c(0, max(cor$x))
-    y_lims <- c(0, max(cor$y))
-    legend_spacing <- (cor$x[2] - cor$x[1]) * 10
+  if (pressure_data[[2]] == "pedar" | pressure_data[[2]] == "stappone") {
+    if (pressure_data[[2]] == "pedar") {
+      if (step_n == "max") {pedar_var <- "max"; step_no <- NA}
+      if (step_n == "meanmax") {pedar_var <- "meanmax"; step_no <- NA}
+      if (is.numeric(step_n)) {pedar_var <- "step_max"; step_no <- step_n}
+      cor <- plot_pedar(pressure_data, pedar_var, step_no, foot_side = "both")
+      x_lims <- c(0, max(cor$x))
+      y_lims <- c(0, max(cor$y))
+      legend_spacing <- (cor$x[2] - cor$x[1]) * 10
+    }
+    if (pressure_data[[2]] == "stappone") {
+      if (step_n == "max") {stapp_var <- "max"; step_no <- NA}
+      if (step_n == "meanmax") {stapp_var <- "meanmax"; step_no <- NA}
+      if (is.numeric(step_n)) {stapp_var <- "step_max"; step_no <- step_n}
+      cor <- plot_stappone(pressure_data, stapp_var, step_no, foot_side = "both")
+      x_lims <- c(0, max(cor$x))
+      y_lims <- c(0, max(cor$y))
+      legend_spacing <- (cor$x[2] - cor$x[1]) * 10
+    }
+
   } else {
     # max size of df
     x_lims <- c(-0.005, max(pressure_data[[7]]$x) + 0.005)
@@ -1305,8 +1521,8 @@ plot_pressure <- function(pressure_data, variable = "max", smooth = FALSE,
 
 #' @title Animate pressure
 #' @description Produces animation (gif) of pressure data
-#' @param pressure_data Array. A 3D array covering each timepoint of the
-#'   measurement. z dimension represents time
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param plot_colors String
 #' @param fps Numeric. Number of frames per second in animation
 #' @param dpi Numeric. Resolution of gif
@@ -1315,7 +1531,7 @@ plot_pressure <- function(pressure_data, variable = "max", smooth = FALSE,
 #' @examplesIf interactive()
 #' emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
 #' pressure_data <- load_emed(emed_data)
-#' animate_pressure(pressure_data, fps = 10, file_name = "pli_gif.gif")
+#' animate_pressure(pressure_data, fps = 10, file_name = "stapp_gif.gif")
 #' @importFrom stringr str_ends str_pad
 #' @importFrom magick image_graph image_animate image_write image_info
 #' image_read
@@ -1378,10 +1594,10 @@ animate_pressure <- function(pressure_data, plot_colors = "default", fps,
 
 #' @title Create masking
 #' @description Allows user to manually define mask regions
-#' @param pressure_data List. First item is a matrix covering each timepoint
-#' of the measurement.
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param mask_definition String. "by_vertices" or "by_sensors". The first
-#' option let's you draw a shape around the area you want to select, the
+#' option lets you draw a shape around the area you want to select, the
 #' second allows you to define this area by clicking on specific sensors
 #' @param n_masks Numeric. Number of masks to add
 #' @param n_verts Numeric. Number of vertices in mask
@@ -1393,8 +1609,8 @@ animate_pressure <- function(pressure_data, plot_colors = "default", fps,
 #' @param plot Logical. Show new maks on pressure image
 #' @return List. Mask(s) are added to pressure data variable
 #' \itemize{
-#'   \item pressure_array. 3D array covering each timepoint of the measurement.
-#'            z dimension represents time
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            Sensors are columns, time is rows
 #'   \item pressure_system. String defining pressure system
 #'   \item sens_size. Numeric vector with the dimensions of the sensors
 #'   \item time. Numeric value for time between measurements
@@ -1410,8 +1626,8 @@ animate_pressure <- function(pressure_data, plot_colors = "default", fps,
 #' n_masks = 1, n_verts = 4)
 #' pressure_data <- create_mask_manual(pressure_data, mask_definition = "by_sensors",
 #' n_masks = 1, n_sens = 8)
-#' @importFrom grDevices x11
-#' @importFrom ggmap gglocator
+#' @importFrom grDevices dev.new
+# @importFrom ggmap gglocator
 #' @importFrom ggplot2 aes geom_path
 #' @importFrom sf st_polygon
 #' @export
@@ -1442,11 +1658,12 @@ create_mask_manual <- function(pressure_data, mask_definition = "by_vertices", n
         mask_coord
     }
   } else {
-    grDevices::x11()
+    dev.new(noRStudioGD = TRUE)
     g <- plot_pressure(pressure_data, plot = FALSE)
     #g <- g + scale_x_continuous(expand = c(0, 0), limits = c(-0.01, 0.15))
     #g <- g + scale_y_continuous(expand = c(0, 0), limits = c(-0.01, 0.30))
     print(g)
+    #readline("Press Enter when the plot has loaded...")
   }
 
   # define mask by vertices
@@ -1456,7 +1673,7 @@ create_mask_manual <- function(pressure_data, mask_definition = "by_vertices", n
 
       # interactively select area
       message("Select mask corners")
-      mask <- gglocator(n_verts)
+      mask <- gg_locator(n_verts)
 
       # if requested, allow closely selected mask vertices to share a vertex
       if (threshold > 0) {
@@ -1500,10 +1717,13 @@ create_mask_manual <- function(pressure_data, mask_definition = "by_vertices", n
 
     # selection of sensors
     message(paste0("Select ", n_sens, " adjacent sensors to define your custom mask"))
-    sensor_pts <- gglocator(n_sens)
+    sensor_pts <- gg_locator(n_sens)
 
     # find which sensors points fall in
-    sensor_polygons <- sens_df_2_polygon(pressure_data[[7]])
+    sens_polys <- pressure_data[[7]]
+    sens_polys[, 1] <- round(sens_polys[, 1], 8)
+    sens_polys[, 2] <- round(sens_polys[, 2], 8)
+    sensor_polygons <- sens_df_2_polygon(sens_polys)
     sensor_list <- c()
     for (pts in 1:n_sens) {
       point <- sf::st_point(c(sensor_pts[pts, 1], sensor_pts[pts, 2]))
@@ -1553,8 +1773,8 @@ create_mask_manual <- function(pressure_data, mask_definition = "by_vertices", n
 
 #' @title Automatically mask pressure footprint
 #' @description Automatically creates mask for footprint data
-#' @param pressure_data List. First item is a 3D array covering each timepoint
-#' of the measurement. z dimension represents time
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param masking_scheme String. "automask_simple", "automask_novel",
 #' "pedar_mask1", "pedar_mask2", "pedar_mask3", "template".
 #' "simple_automask" applies a simple 3 part mask (hindfoot, midfoot, forefoot)
@@ -1580,10 +1800,12 @@ create_mask_manual <- function(pressure_data, mask_definition = "by_vertices", n
 #' @param plot Logical. Whether to play the animation
 #' @param template_mask Data frame. Mask to be used if "template_mask" is
 #' selected as the masking scheme
+#' @param hal_start Numeric. Adjust medial start point of toe line
+#' @param toe_start Numeric. Adjust lateral start point of toe line
 #' @return List. Masks are added to pressure data variable
 #' \itemize{
-#'   \item pressure_array. 3D array covering each timepoint of the measurement.
-#'            z dimension represents time
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            Sensors are columns, time is rows
 #'   \item pressure_system. String defining pressure system
 #'   \item sens_size. Numeric vector with the dimensions of the sensors
 #'   \item time. Numeric value for time between measurements
@@ -1600,8 +1822,9 @@ create_mask_manual <- function(pressure_data, mask_definition = "by_vertices", n
 #' @export
 
 create_mask_auto <- function(pressure_data, masking_scheme, foot_side = "auto",
-                             res_value = c(20000, 20000, 100000, 20000),
-                             plot = TRUE, template_mask = NULL) {
+                             res_value = c(20000, 20000, 100000, 50000),
+                             plot = TRUE, template_mask = NULL,
+                             hal_start = 0.5, toe_start = 0.2) {
   # simple
   if (masking_scheme == "automask_simple") {
     if (pressure_data[[2]] == "pedar")
@@ -1613,11 +1836,12 @@ create_mask_auto <- function(pressure_data, masking_scheme, foot_side = "auto",
 
   # full auto mask novel
   if (masking_scheme == "automask_novel") {
-    if (!(pressure_data[[2]] == "emed" || pressure_data[[2]] == "pliance"))
-      stop("automask is not compatible with this type of data")
+    #if (!(pressure_data[[2]] == "emed" || pressure_data[[2]] == "pliance"))
+    #  stop("automask is not compatible with this type of data")
     pressure_data <- automask(pressure_data, "automask_novel",
                               res_scale = res_value, foot_side = foot_side,
-                              plot = FALSE)
+                              plot = FALSE, hal_start = hal_start,
+                              toe_start = toe_start)
   }
 
   # pedar masks
@@ -1659,8 +1883,8 @@ create_mask_auto <- function(pressure_data, masking_scheme, foot_side = "auto",
 
 #' @title Edit mask
 #' @description Allows user to manually adjust mask vertices
-#' @param pressure_data List. First item is a 3D array covering each timepoint
-#' of the measurement.
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param n_edit Numeric. Number of vertices to edit
 #' @param threshold Numeric. Distance between point clicked and vertex that is
 #' selected
@@ -1671,8 +1895,8 @@ create_mask_auto <- function(pressure_data, masking_scheme, foot_side = "auto",
 #' average value of sensors over time
 #' @return List. Edited mask is added to the pressure data variable
 #' \itemize{
-#'   \item pressure_array. 3D array covering each timepoint of the measurement.
-#'            z dimension represents time
+#'   \item pressure_array. 2D array covering each timepoint of the measurement.
+#'            Sensors are columns, time is rows
 #'   \item pressure_system. String defining pressure system
 #'   \item sens_size. Numeric vector with the dimensions of the sensors
 #'   \item time. Numeric value for time between measurements
@@ -1721,7 +1945,7 @@ edit_mask <- function(pressure_data, n_edit, threshold = 0.002,
     color_v <- rainbow(n_edit + 1)
     for (edit in seq(1, n_edit)){
       message("Select mask vertex to edit, then it's new location")
-      mask <- gglocator(2)
+      mask <- gg_locator(2)
       mask_vertices_edit[nrow(mask_vertices_edit) + 1, ] <- mask[1, ]
       edit_distance <- as.matrix(dist(mask_vertices_edit))
       close_v <-
@@ -1730,7 +1954,7 @@ edit_mask <- function(pressure_data, n_edit, threshold = 0.002,
 
       while (length(close_v) == 0) {
         message("The point selected isn't close to any existing vertex, try again")
-        mask <- gglocator(2)
+        mask <- gg_locator(2)
         mask_vertices_edit[nrow(mask_vertices_edit) + 1, ] <- mask[1,]
         edit_distance <- as.matrix(dist(mask_vertices_edit))
         close_v <-
@@ -1785,8 +2009,8 @@ edit_mask <- function(pressure_data, n_edit, threshold = 0.002,
 #' @description Determine Center of Pressure Excursion Index (CPEI) for
 #' footprint pressure data
 #' @author Scott Telfer \email{scott.telfer@gmail.com}
-#' @param pressure_data List. First item is a 3D array covering each timepoint
-#' of the measurement. Not currently available for pedar.
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement. Not currently available for pedar.
 #' @param foot_side String. "right" or "left". Required for automatic detection
 #' of points
 #' @param plot_result Logical. Plots pressure image with COP and CPEI overlaid
@@ -1800,7 +2024,7 @@ edit_mask <- function(pressure_data, n_edit, threshold = 0.002,
 #' @importFrom dplyr pull summarise
 #' @export
 
-cpei <- function(pressure_data, foot_side, plot_result = TRUE) {
+cpei <- function(pressure_data, foot_side = "auto", plot_result = TRUE) {
   # check set up
   if (interactive() == FALSE)
     stop("we recommend user reviews each measurement")
@@ -1932,16 +2156,19 @@ cpei <- function(pressure_data, foot_side, plot_result = TRUE) {
     #g <- g + geom_line(data = med_side_df, aes(X, Y), linetype = "dashed",
     #                   color = "black", size = 1.5)
     g <- g + geom_line(data = cpe_df, aes(X, Y), color = "black",
-                       size = 2)
+                       linewidth = 2)
     g <- g + geom_line(data = cop_side_df, aes(X, Y), colour = "blue",
                        alpha = 0.8)
     print(g)
+
+    # return
+    return(CPEI)
   }
 
   # manual select function
   #manually_select <- function(n_points, mess) {
   #  message(mess)
-  #  x <- gglocator(n_points)
+  #  x <- gg_locator(n_points)
   #  colnames(x) <- c("x_coord", "y_coord")
   #  return(x)
   #}
@@ -1989,8 +2216,8 @@ cpei <- function(pressure_data, foot_side, plot_result = TRUE) {
 # =============================================================================
 
 #' Analyze masked regions of pressure data
-#' @param pressure_data List. Includes a 3D array covering each timepoint of the
-#'   measurement. z dimension represents time
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param partial_sensors Logical Defines how sensors that do not
 #'   lie wholly within mask are dealt with. If FALSE, they will be excluded;
 #'   if TRUE, for relevant variables their contribution will be weighted by the
@@ -2241,8 +2468,8 @@ mask_analysis <- function(pressure_data, partial_sensors = FALSE,
 # =============================================================================
 
 #' Calculate Arch Index.
-#' @param pressure_data List. Includes a 3D array covering each timepoint of the
-#'   measurement. z dimension represents time
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param plot Logical. Not implemented yet
 #' @return Numeric. Arch index value
 #' @examples
@@ -2278,8 +2505,7 @@ arch_index <- function(pressure_data, plot = TRUE) {
 
   # remove toes
   sens_poly <- sens_df_2_polygon(pressure_data[[7]])
-  mask_fp <- create_mask_auto(pressure_data, "automask_novel",
-                              res_value = 100000, plot = FALSE)
+  mask_fp <- create_mask_auto(pressure_data, "automask_novel", plot = FALSE)
   mask_fp <- mask_fp[[5]]
   not_in_mask <- c()
   for (j in 1:length(sens_poly)) {
@@ -2380,8 +2606,8 @@ arch_index <- function(pressure_data, plot = TRUE) {
 
 #' @title Get outline of pressure region
 #' Determine outline (convex hull) of pressure measurement
-#' @param pressure_data List. Includes a 3D array covering each timepoint of the
-#'   measurement. z dimension represents time
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param pressure_image String. "max" = footprint of maximum sensors. "frame"
 #' = an individual frame
 #' @param frame Integer. Frame number to use
@@ -2396,6 +2622,9 @@ arch_index <- function(pressure_data, plot = TRUE) {
 #' @noRd
 
 pressure_outline <- function(pressure_data, pressure_image = "max", frame) {
+  # global variables
+  id <- NULL
+
   # check inputs
   if (is.array(pressure_data[[1]]) == FALSE)
     stop("pressure data must contain array")
@@ -2417,7 +2646,10 @@ pressure_outline <- function(pressure_data, pressure_image = "max", frame) {
   fp_chull <- st_convex_hull(st_combine(sens_coords_df))
 
   # add buffer here
-  buffer_size <- pressure_data[[3]][1] / 2
+  sens_1 <- pressure_data[[7]] %>%
+    filter(id == unique(pressure_data[[7]]$id)[1])
+  base_x <- max(sens_1$x) - min(sens_1$x)
+  buffer_size <- base_x / 2
   fp_chull_buffer <- st_buffer(fp_chull, buffer_size)
 
   # return convex hull coordinates
@@ -2555,8 +2787,8 @@ masks_2_df <- function(masks) {
 
 #' @title Get coordinates of active sensors
 #' @description Produces a data frame with coordinates of sensors
-#' @param pressure_data List. Includes a 3D array covering each timepoint of the
-#'   measurement. z dimension represents time
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param pressure_image. String. Which pressure image to use. Options are
 #' "all_active", "all", or "frame".
 #' @param frame Numeric. If pressure image is frame, the numeric value should be
@@ -2577,8 +2809,8 @@ sensor_coords <- function(pressure_data, pressure_image = "all_active", frame) {
   }
 
   # dimensions
-  sens_x <- abs(unique(pressure_data$sens_polygons$x)[2] - unique(pressure_data$sens_polygons$x)[1])
-  sens_y <- abs(unique(pressure_data$sens_polygons$y)[2] - unique(pressure_data$sens_polygons$y)[1])
+  sens_x <- abs(unique(pressure_data$sensor_polygons$x)[2] - unique(pressure_data$sensor_polygons$x)[1])
+  sens_y <- abs(unique(pressure_data$sensor_polygons$y)[2] - unique(pressure_data$sensor_polygons$y)[1])
 
   # data frame with active sensors as coordinates
   x_cor <- seq(from = sens_x / 2, by = sens_x, length.out = ncol(sens))
@@ -2619,8 +2851,10 @@ sensor_2_polygon <- function(pressure_data, pressure_image = "all_active",
     sens_coords <- sensor_coords(pressure_data, pressure_image, frame)
 
     # sensor dimensions
-    width <- pressure_data[[3]][1] / 2
-    height <- pressure_data[[3]][2] / 2
+    sens_1 <- pressure_data[[7]] %>%
+      filter(id == unique(pressure_data[[7]]$id)[50])
+    width <- max(sens_1$x) - min(sens_1$x)
+    height <- max(sens_1$y) - min(sens_1$y)
 
     # get corner points and make into polygon
     for (sens in 1:nrow(sens_coords)) {
@@ -2817,6 +3051,48 @@ sens_df_2_polygon <- function(sens_polygons) {
   return(sensor_polys)
 }
 
+poly_2_matrix <- function(pressure_data) {
+  id <- NULL
+
+  # get sensor polygon df
+  sens_polys <- pressure_data[[7]]
+
+  # check if number of sensors is different
+  if (length(unique(sens_polys$id)) != ncol(pressure_data[[1]])) {stop("issue generating max matrix")}
+
+  # check if sensors are same size and dimensions
+  if (length(unique(signif(pressure_data[[3]], 6))) != 1) {stop("not possible to generate max matrix")}
+
+  # make grid based on sensor sizes
+  x_max <- max(sens_polys$x)
+  x_min <- min(sens_polys$x)
+  y_max <- max(sens_polys$y)
+  y_min <- min(sens_polys$y)
+  sens_1 <- sens_polys %>% filter(id == 1)
+  base_x <- max(sens_1$x) - min(sens_1$x)
+  base_y <- max(sens_1$y) - min(sens_1$y)
+  n_rows <- round(y_max / base_y)
+  n_cols <- round(x_max / base_x)
+
+  # sensor centroids
+  centroids <- sensor_centroid(pressure_data)
+
+  # find which grid square each sensor falls in and map to matrix
+  pressure_max <- apply(pressure_data[[1]], 2, max)
+  max_mat <- matrix(NA, nrow = n_rows, ncol = n_cols)
+  for (i in 1:nrow(centroids)) {
+    # position
+    mat_col <- ceiling((centroids[i, 1] / x_max) * n_cols)
+    mat_row <- (n_rows + 1) - ceiling((centroids[i, 2] / y_max) * n_rows)
+
+    # map to matrix
+      max_mat[mat_row, mat_col] <- pressure_max[i]
+  }
+
+  # return
+  return(max_mat)
+}
+
 #' @title Sensor area
 #' @description Calculates area of sensors from corner vertices
 #' @param sensor_df Data frame. Contains sensor corner vertices
@@ -2953,6 +3229,47 @@ plot_pedar <- function(pressure_data, pressure_image = "max",
   return(df)
 }
 
+plot_stappone <- function(pressure_data, pressure_image = "max",
+                          foot_side = "left", step_n) {
+  # check this is pedar (or other suitable) data
+  if (!(pressure_data[[2]] == "stappone"))
+    stop("data should be from stappone")
+
+  # pressure image
+  if (pressure_image == "max") {
+    comb_data <- apply(pressure_data[[1]], 2, max)
+  }
+
+  # separate into steps
+  if (pressure_image == "step_max") {
+    events <- pressure_data[[6]]
+    pressure_mat <- pressure_data[[1]]
+    pressure_mat <- pressure_mat[c(events[step_n, 2]:events[step_n, 3]), ]
+    comb_data <- apply(pressure_mat, 2, max)
+  }
+
+  # average across steps
+  if (pressure_image == "meanmax") {
+    comb_data <- footprint(pressure_data, "meanmax")
+  }
+
+  # make ids
+  ids <- 1:12
+
+  # make df
+  df <- data.frame(id = ids, value = comb_data)
+
+  # add coordinates to df
+  position <- pressure_data[[7]]
+  df <- merge(df, position, by = c("id"))
+
+  # add color
+  df <- generate_colors(df)
+
+  # return
+  return(df)
+}
+
 
 #' @title Generate colors
 #' @description Let's the user prescribe the color scale for plots
@@ -3083,7 +3400,7 @@ st_line2polygon <- function(mat, distance, direction) {
 #' @param end Vector. x and y coords
 #' @param base_x Numeric
 #' @param base_y Numeric
-#' @param res_scale Numeric
+#' @param res_value Numeric
 #' @param extend_line Logical. extends line horizontally
 #' @importFrom sf st_cast st_join st_sf
 #' @importFrom raster raster adjacent extent ncell
@@ -3093,9 +3410,9 @@ st_line2polygon <- function(mat, distance, direction) {
 #' @noRd
 
 shortest_path <- function(mat, offset_distance, start, end, base_x, base_y,
-                          res_scale, extend_line = TRUE) {
+                          res_value, extend_line = TRUE) {
   ## scale
-  mat_norm <- mat / res_scale
+  mat_norm <- mat / res_value
   r <- raster(mat_norm)
   raster::extent(r) <- c(base_x * -1, base_x * (ncol(mat_norm) + 1),
                          offset_distance,
@@ -3146,6 +3463,10 @@ shortest_path <- function(mat, offset_distance, start, end, base_x, base_y,
 #' @description Calculates line proximal to toes
 #' @param pressure_data List. First item should be a 3D array covering each
 #' timepoint of the measurement. z dimension represents time
+#' @param side String
+#' @param res_scale Numeric
+#' @param hal_start Numeric
+#' @param toe_start Numeric
 #' @importFrom sf st_cast st_join st_sf
 #' @importFrom raster raster adjacent extent ncell
 #' @importFrom gdistance transition geoCorrection shortestPath
@@ -3153,7 +3474,8 @@ shortest_path <- function(mat, offset_distance, start, end, base_x, base_y,
 #' @importFrom stats var
 #' @noRd
 
-toe_line <- function(pressure_data, side, res_scale = 10000) {
+toe_line <- function(pressure_data, side, res_scale,
+                     hal_start, toe_start) {
   # global variables
   id <- NULL
 
@@ -3183,8 +3505,8 @@ toe_line <- function(pressure_data, side, res_scale = 10000) {
   active_cols <- which(apply(pf_max_top, 2, var) != 0)
   active_rows <- which(rowSums(pf_max_top) > 0)
   active_row_1 <- active_rows[1]
-  row_25 <- round((nrow(pf_max_top) - active_row_1) * 0.25)
-  row_70 <- round((nrow(pf_max_top) - active_row_1) * 0.6)
+  row_25 <- round((nrow(pf_max_top) - active_row_1) * toe_start)
+  row_70 <- round((nrow(pf_max_top) - active_row_1) * hal_start)
 
   ## start point
   start_y <- offset_distance + (nrow(pf_max_top) * base_y) -
@@ -3210,7 +3532,7 @@ toe_line <- function(pressure_data, side, res_scale = 10000) {
 
   # line
   toe_line_mat <- shortest_path(mat = pf_max_top, offset_distance, start, end,
-                                base_x, base_y, res_scale)
+                                base_x, base_y, res_scale[3])
 
   # return
   return(toe_line_mat)
@@ -3230,7 +3552,7 @@ edge_lines <- function(pressure_data, side) {
   x <- y <- x_coord <- y_coord <- me <- sc_df <- mbb <- NULL
 
   # max pressure image
-  max_fp <- pressure_data[[8]]
+  #max_fp <- pressure_data[[8]]
 
   # coordinates
   sens_coords <- pressure_data[[7]][, c(1, 2)]
@@ -3433,7 +3755,7 @@ icp_mask <- function(x, y, mask_list, iterations = 100, mindist = 1e15,
 #' @noRd
 align_mask <- function(pressure_data, masks) {
   # get outline of pressure
-  outline_coords <- pressure_data$sens_polygons[, c(1, 2)] %>%
+  outline_coords <- pressure_data$sensor_polygons[, c(1, 2)] %>%
     st_as_sf(coords = c("x", "y"))
   outline_chull <- st_convex_hull(st_combine(outline_coords))
   outline_coords_mat <- st_coordinates(outline_chull)[, c(1, 2)]
@@ -3460,8 +3782,8 @@ align_mask <- function(pressure_data, masks) {
 
 #' @title Visualize masks
 #' @description Visualize the existing masks
-#' @param pressure_data List. First item is a 3D array covering each timepoint
-#' of the measurement.
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param visual_list List. Mask numbers that want to be viewed. (Default is
 #' all exisiting masks)
 #' @param image String."max" = footprint of maximum sensors. "mean"
@@ -3483,6 +3805,7 @@ plot_masks <- function(pressure_data,
   X <- Y <- NULL
 
   # initialize plot
+  dev.new(noRStudioGD = TRUE)
   #grDevices::x11()
 
   if (pressure_data[[2]] != "pedar"){
@@ -3626,6 +3949,46 @@ pti_2 <- function(pressure_data_, pressure_data, sens_mask_df, mask) {
   return(val)
 }
 
+#' @title Plantar Pressure Gradient
+#' @description Calculate PPPG
+#' @importFrom rdist cdist
+#' @noRd
+
+ppga <- function(pressure_data_, sens_mask_df, mask) {
+  # sensor centroids
+  sens_coords <- sensor_centroid(pressure_data_)
+
+  # by mask
+  mask_sens <- which(sens_mask_df[, mask] > 0)
+  sens_coords_ <- sens_coords[mask_sens, ]
+
+  # ppga vector
+  ppga <- rep(NA, nrow(sens_coords_))
+
+  # loop through sensors
+  for (sens in 1:nrow(sens_coords_)) {
+    single_mat <- as.matrix(sens_coords_[sens, ])
+    sens_coord_mat <- as.matrix(sens_coords_)
+
+    distances <- cdist(single_mat, sens_coord_mat)
+    surr_sens <- which(distances < 0.009)
+    surr_sens <- surr_sens[surr_sens != sens]
+
+    # pressure difference in all directions
+    p_array <- pressure_data_[[1]]
+    p_array <- p_array[, mask_sens]
+    for (ssens in 1:length(surr_sens)) {
+      pga <- max(abs(p_array[, sens] - p_array[, surr_sens[ssens]]))
+
+      # normalize by distance
+      ppga[sens] <- (pga / distances[surr_sens[ssens]]) / 1000
+    }
+  }
+
+  # return
+  return(max(ppga))
+}
+
 
 #' @title Force time integral
 #' @description Calculate FTI
@@ -3765,13 +4128,15 @@ sensor_centroid <- function(pressure_data) {
 
 #' @title automask footprint
 #' @description Automatically creates mask of footprint data
-#' @param pressure_data List. First item is a 3D array covering each timepoint
-#' of the measurement. z dimension represents time
+#' @param pressure_data List. First item should be a 2D array covering each
+#' timepoint of the measurement.
 #' @param mask_scheme String.
 #' @param res_scale Numeric vector. Defines low cost functions for lines
 #' @param foot_side String. "RIGHT", "LEFT", or "auto". Auto uses
 #' auto_detect_side function
 #' @param plot Logical. Whether to play the animation
+#' @param hal_start Numeric
+#' @param toe_start Numeric
 #' @return List. Masks are added to pressure data variable
 #' \itemize{
 #'   \item pressure_array. 3D array covering each timepoint of the measurement.
@@ -3787,14 +4152,14 @@ sensor_centroid <- function(pressure_data) {
 #' @noRd
 
 automask <- function(pressure_data, mask_scheme, res_scale, foot_side = "auto",
-                     plot = TRUE) {
+                     hal_start, toe_start, plot = TRUE) {
   # check data isn't from pedar
   if (pressure_data[[2]] == "pedar")
     stop("automask doesn't work with pedar data")
 
   # global variables
   x <- y <- mask <- x_coord <- y_coord <- me <- heel_cut_dist <-
-    mfoot_cut_prox <- ffoot_cut_prox <- NULL
+    mfoot_cut_prox <- id <- ffoot_cut_prox <- NULL
 
   # Find footprint (max)
   max_df <- pressure_data[[8]]
@@ -3824,6 +4189,12 @@ automask <- function(pressure_data, mask_scheme, res_scale, foot_side = "auto",
   side1 <- mbb[c(1:2), ]
   side2 <- mbb[c(3:4), ]
 
+  # sensor dimensions
+  sens_1 <- pressure_data[[7]] %>%
+    filter(id == unique(pressure_data[[7]]$id)[50])
+  base_x <- max(sens_1$x) - min(sens_1$x)
+  base_y <- max(sens_1$y) - min(sens_1$y)
+
   ## Get distal 27% and 55% lines that divide into masks
   ### heel
   side1_27 <- side1[1, ] + ((side1[2, ] - side1[1, ]) * 0.27)
@@ -3832,8 +4203,8 @@ automask <- function(pressure_data, mask_scheme, res_scale, foot_side = "auto",
   line_27 <- st_extend_line(line_27, 1)
   line_27_ints <- st_coordinates(st_intersection(fp_chull, line_27))
   heel_line <- shortest_path(max_df, 0, line_27_ints[1, c(1:2)],
-                             line_27_ints[2, c(1:2)], 0.005, 0.005,
-                             res_scale[1])
+                             line_27_ints[2, c(1:2)],
+                             base_x, base_y, res_value = res_scale[1])
   heel_line_dist_poly <- st_line2polygon(st_linestring(heel_line), 1, "+Y")
   heel_line_prox_poly <- st_line2polygon(st_linestring(heel_line), 1, "-Y")
 
@@ -3844,8 +4215,8 @@ automask <- function(pressure_data, mask_scheme, res_scale, foot_side = "auto",
   line_55 <- st_extend_line(line_55, 1)
   line_55_ints <- st_coordinates(st_intersection(fp_chull, line_55))
   midff_line <- shortest_path(max_df, 0, line_55_ints[1, c(1:2)],
-                              line_55_ints[2, c(1:2)], 0.005, 0.005,
-                              res_scale[2])
+                              line_55_ints[2, c(1:2)],
+                              base_x, base_y, res_scale[2])
   midff_line_dist_poly <- st_line2polygon(st_linestring(midff_line), 1, "+Y")
   midff_line_prox_poly <- st_line2polygon(st_linestring(midff_line), 1, "-Y")
 
@@ -3893,7 +4264,8 @@ automask <- function(pressure_data, mask_scheme, res_scale, foot_side = "auto",
 
     ## simplify toe line
     ### toe line
-    toe_line_mat <- toe_line(pressure_data, side, res_scale[3])
+    toe_line_mat <- toe_line(pressure_data, side, res_scale,
+                             hal_start = hal_start, toe_start = toe_start)
     HX_toe_pt <- st_intersection(st_linestring(toe_line_mat), MT_hx_line)
     MT12_toe_pt <- st_intersection(st_linestring(toe_line_mat), MT_12_line)
     MT23_toe_pt <- st_intersection(st_linestring(toe_line_mat), MT_23_line)
@@ -3917,7 +4289,7 @@ automask <- function(pressure_data, mask_scheme, res_scale, foot_side = "auto",
     hx_int_top_[2] <- hx_int_top_[2] - 0.003
     HX_toe_pt_ <- c(st_coordinates(HX_toe_pt))
     hx_l <- shortest_path(max_df, 0, HX_toe_pt_,
-                          hx_int_top_, 0.005, 0.005, res_scale[4],
+                          hx_int_top_, base_x, base_y, res_scale[4],
                           extend_line = FALSE)
     hx_line <- rbind(c(hx_l[1, 1], hx_l[1, 2] - 1), hx_l,
                      c(hx_l[nrow(hx_l), 1], hx_l[nrow(hx_l), 2] + 1))
@@ -4186,7 +4558,7 @@ pedar_mask2 <- function(pressure_data) {
 pedar_mask3 <- function(pressure_data) {
   # define masks by sensel numbers
   med_rf_L <- pedar_polygon(pressure_data, c(1:2, 6:8, 13:15, 20:22))
-  lat_rf_L <-pedar_polygon(pressure_data, c(9:12, 16:19, 23:26))
+  lat_rf_L <-pedar_polygon(pressure_data, c(3:5, 9:12, 16:19, 23:26))
   med_mf_L <- pedar_polygon(pressure_data, c(27:29, 34:36, 41:43, 48:50, 55:57))
   lat_mf_L <- pedar_polygon(pressure_data, c(30:33, 37:40, 44:47, 51:54, 58:59))
   MTPJ1_L <- pedar_polygon(pressure_data, c(62:63, 69:70, 76:77))
@@ -4197,7 +4569,7 @@ pedar_mask3 <- function(pressure_data) {
 
   med_rf_R <- pedar_polygon(pressure_data, c(100:101, 105:107, 112:114,
                                              119:121))
-  lat_rf_R <-pedar_polygon(pressure_data, c(108:111, 115:118, 122:125))
+  lat_rf_R <-pedar_polygon(pressure_data, c(102:104, 108:111, 115:118, 122:125))
   med_mf_R <- pedar_polygon(pressure_data, c(126:128, 133:135, 140:142, 147:149,
                                              154:156))
   lat_mf_R <- pedar_polygon(pressure_data, c(129:132, 136:139, 143:146, 150:153,
@@ -4279,6 +4651,30 @@ dpli <- function(pressure_data_, pressure_data, sens_mask_df, mask,
   return(val)
 }
 
+
+#' title gglocator replacement
+#' @noRd
+gg_locator <- function(n = 1) {
+  coords <- data.frame(x = numeric(n), y = numeric(n))
+
+  pb <- ggplot2::ggplot_build(ggplot2::last_plot())
+  x_range <- pb$layout$panel_params[[1]]$x.range
+  y_range <- pb$layout$panel_params[[1]]$y.range
+
+  vp_tree <- as.character(grid::current.vpTree(all = TRUE))
+  panel_vp <- regmatches(vp_tree, regexpr("panel\\.[0-9]+-[0-9]+-[0-9]+-[0-9]+", vp_tree))
+
+  grid::seekViewport(panel_vp)
+
+  for (i in 1:n) {
+    loc <- grid::grid.locator("npc")
+    coords[i, 1] <- x_range[1] + as.numeric(loc$x) * diff(x_range)
+    coords[i, 2] <- y_range[1] + as.numeric(loc$y) * diff(y_range)
+  }
+
+  grid::upViewport(0)
+  return(coords)
+}
 
 # =============================================================================
 
@@ -4531,4 +4927,56 @@ pedar_insole_grids <- function() {
            0.822, 0.822, 0.822, 0.822, 0.822, 0.822, 0.822, 0.878, 0.878, 0.878,
            0.878, 0.878, 0.878, 0.931, 0.931, 0.931, 0.931))
   return(pedar_insole_grid)
+}
+
+stappone_insole_polys <- function() {
+  stappone_insole_poly <- data.frame(
+    id = c(1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,3,
+               3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
+               5,5,5,5,5,5,5,5,5,5,5,5,5,5,6,6,6,6,6,6,6,6,6,6,6,6,6,7,7,7,7,7,
+               7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+               9,9,9,9,9,9,9,9,9,9,9,9,9,10,10,10,10,10,10,10,10,10,10,10,10,10,
+               10,10,10,10,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,12,12,
+               12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12),
+    x = c(-56,-54.52,-55.2,-54.13,-50.7,-47.23,-43.47,-42.74,-40.76,-39.94,
+          -39.89,-44.35,-48.33,-56.84,-56.27,-56,-46.72,-45.72,-46.72,-46.05,
+          -47.07,-44.02,-41.24,-37.84,-39.85,-40.49,-42.29,-42.36,-43.84,-45.37,
+          -46.72,-50.91,-56.1,-62.54,-66.01,-67.68,-66.27,-66.62,-65.41,-65.46,
+          -60.92,-54.81,-54.6,-53.22,-51.91,-48.74,-43.91,-43.94,-50.91,-73.14,
+          -72.27,-70.22,-67.06,-64.79,-66.12,-64.86,-65.75,-64.11,-66.82,-70.08,
+          -73.15,-71.64,-72.89,-73.14,-58.9,-59.58,-59.15,-60.97,-59,-56.91,
+          -54.09,-54.95,-52.09,-53.08,-52.54,-55.44,-58.11,-58.9,-84.07,-85.91,
+          -84.33,-85.38,-83.41,-80.72,-78.66,-78.29,-77.67,-77.71,-77.06,-80.55,
+          -84.07,-90.43,-92.49,-95.92,-94.25,-85.96,-81.34,-75.83,-75.36,-76.09,
+          -69.97,-73.03,-77.03,-82.12,-80.45,-77.01,-83.18,-88.26,-88.09,-88.33,
+          -89.53,-90.43,-86.59,-87.2,-89.06,-87.86,-83.87,-80.61,-76.5,-75.3,
+          -76.55,-75.51,-74.57,-75.37,-78.6,-81.96,-84.37,-86.59,-96.13,-96.15,
+          -96.77,-95.17,-94.17,-92.88,-90.75,-92.37,-90.14,-91.01,-89.47,-92.01,
+          -96.13,-71.21,-67.92,-69.43,-70.24,-67.89,-62.94,-57.2,-51.16,-50.06,
+          -49.22,-50.56,-49.17,-50.23,-55.39,-61.49,-67.35,-71.21,-68.43,-62.23,
+          -57.02,-49.47,-49.91,-49.64,-48.93,-52.15,-56.87,-61.92,-68.65,-68.06,
+          -68.44,-66.49,-68.43,-94.04,-92.51,-88.27,-82.66,-73.33,-67.15,-63.8,
+          -59.97,-63.42,-61.53,-64.75,-64.18,-71.24,-78.26,-86.5,-91.57,-93.62,
+          -95.17,-94.04),
+    y = c(172.4,182.96,189.6,191.09,191,189.58,186.43,177.18,166.89,158.35,
+          153.56,153.63,155.6,153.67,162.52,172.4,113.16,119.21,129.51,139.74,
+          147.42,148.93,146.53,141.62,134.16,125.41,118.91,113.96,112.08,112.17,
+          113.16,101.5,100.17,102.71,97.81,91.11,82.67,73.42,67.08,61.17,59.3,
+          59.74,66.74,74.09,83.75,93.94,99.33,106.43,101.5,138.19,144.81,148.12,
+          148.19,144.26,137.25,126.94,118.54,112.2,109.68,110.58,114.33,120.99,
+          129.99,138.19,114.37,120.03,131,141.48,148.83,149.52,148.89,139.38,
+          129.43,118.84,112.38,111.24,111.99,114.37,107.28,114.92,125.6,136.65,
+          142.63,144.43,141.84,134.41,124.24,114.24,108.14,105.59,107.28,57.43,
+          75.09,87.29,98.92,95.75,94.34,95.12,77.84,64.32,47.13,40.87,37.76,
+          29.92,19.93,7.04,5.39,4.11,11.99,22.94,39.73,57.43,-20.51,-12.53,
+          -4.55,-2.21,-2.31,-2.91,-2.05,-3.75,-9.79,-17.04,-24.15,-28.1,-29.23,
+          -29.83,-27.76,-20.51,103.48,111.49,119.1,128.79,132.74,136,134.36,
+          130.34,123.77,115.15,107.83,102.81,103.48,-0.68,11.9,20.03,30.84,
+          34.14,36.16,32.12,27.18,19.04,11.18,5.16,1.24,-0.36,-0.56,0.14,-1.6,
+          -0.68,-8.88,-5.29,-6.75,-5.67,-11.56,-16.77,-23.77,-29.67,-35.33,
+          -36.73,-39.08,-33.04,-25.57,-16.87,-8.88,143.75,150.85,161.91,176.59,
+          184.91,191.73,195.23,195.52,184.63,174.29,162.8,155.65,155.32,151.79,
+          145.75,143.17,141,141.86,143.75)
+  )
+  return(stappone_insole_poly)
 }

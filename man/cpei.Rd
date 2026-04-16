@@ -4,11 +4,11 @@
 \alias{cpei}
 \title{CPEI}
 \usage{
-cpei(pressure_data, foot_side, plot_result = TRUE)
+cpei(pressure_data, foot_side = "auto", plot_result = TRUE)
 }
 \arguments{
-\item{pressure_data}{List. First item is a 3D array covering each timepoint
-of the measurement. Not currently available for pedar.}
+\item{pressure_data}{List. First item should be a 2D array covering each
+timepoint of the measurement. Not currently available for pedar.}
 
 \item{foot_side}{String. "right" or "left". Required for automatic detection
 of points}
@@ -23,7 +23,7 @@ Determine Center of Pressure Excursion Index (CPEI) for
 footprint pressure data
 }
 \examples{
-\dontshow{if (interactive()) (if (getRversion() >= "3.4") withAutoprint else force)(\{ # examplesIf}
+\dontshow{if (interactive()) withAutoprint(\{ # examplesIf}
 emed_data <- system.file("extdata", "emed_test.lst", package = "pressuRe")
 pressure_data <- load_emed(emed_data)
 cpei(pressure_data, foot_side = "auto", plot_result = FALSE)
